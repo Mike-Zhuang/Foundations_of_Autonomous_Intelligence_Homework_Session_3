@@ -1,0 +1,7 @@
+{
+  "python.defaultInterpreterPath": "/Users/mike/miniconda3/envs/fai/bin/python",
+  "python.terminal.activateEnvironment": true,
+  "python.analysis.extraPaths": [
+    "/Users/mike/miniconda3/envs/fai/lib/python3.12/site-packages"
+  ]
+}
