@@ -14,6 +14,10 @@ class HomographyResult:
     homography: Optional[np.ndarray]
     foundMarkerIds: list[int]
     usedPointCount: int
+    reprojectionRmsePx: Optional[float]
+    inlierRatio: Optional[float]
+    imagePoints: list[Tuple[float, float]]
+    worldPoints: list[Tuple[float, float]]
 
 
 class ArucoStaticSolver:
@@ -28,7 +32,15 @@ class ArucoStaticSolver:
         corners, ids, _ = self.detector.detectMarkers(grayFrame)
 
         if ids is None or len(ids) == 0:
-            return HomographyResult(homography=None, foundMarkerIds=[], usedPointCount=0)
+            return HomographyResult(
+                homography=None,
+                foundMarkerIds=[],
+                usedPointCount=0,
+                reprojectionRmsePx=None,
+                inlierRatio=None,
+                imagePoints=[],
+                worldPoints=[],
+            )
 
         imagePoints: list[Tuple[float, float]] = []
         worldPoints: list[Tuple[float, float]] = []
@@ -49,19 +61,46 @@ class ArucoStaticSolver:
                 worldPoints.append((float(worldCorner[0]), float(worldCorner[1])))
 
         if len(imagePoints) < 8:
-            return HomographyResult(homography=None, foundMarkerIds=foundIds, usedPointCount=len(imagePoints))
+            return HomographyResult(
+                homography=None,
+                foundMarkerIds=foundIds,
+                usedPointCount=len(imagePoints),
+                reprojectionRmsePx=None,
+                inlierRatio=None,
+                imagePoints=imagePoints,
+                worldPoints=worldPoints,
+            )
 
         imageArray = np.asarray(imagePoints, dtype=np.float32)
         worldArray = np.asarray(worldPoints, dtype=np.float32)
 
-        homography, _ = cv2.findHomography(imageArray, worldArray, cv2.RANSAC, ransacReprojThreshold=2.5)
+        homography, mask = cv2.findHomography(imageArray, worldArray, cv2.RANSAC, ransacReprojThreshold=2.5)
         if homography is None:
-            return HomographyResult(homography=None, foundMarkerIds=foundIds, usedPointCount=len(imagePoints))
+            return HomographyResult(
+                homography=None,
+                foundMarkerIds=foundIds,
+                usedPointCount=len(imagePoints),
+                reprojectionRmsePx=None,
+                inlierRatio=None,
+                imagePoints=imagePoints,
+                worldPoints=worldPoints,
+            )
+
+        reprojection = cv2.perspectiveTransform(imageArray.reshape(-1, 1, 2), homography).reshape(-1, 2)
+        error = reprojection - worldArray
+        rmse = float(np.sqrt(np.mean(np.sum(error * error, axis=1))))
+        inlierRatio = None
+        if mask is not None and mask.size > 0:
+            inlierRatio = float(np.mean(mask.astype(np.float32)))
 
         return HomographyResult(
             homography=homography,
             foundMarkerIds=foundIds,
             usedPointCount=len(imagePoints),
+            reprojectionRmsePx=rmse,
+            inlierRatio=inlierRatio,
+            imagePoints=imagePoints,
+            worldPoints=worldPoints,
         )
 
     @staticmethod
@@ -88,5 +127,8 @@ def drawOverlay(frame: np.ndarray, homographyResult: HomographyResult, targetPix
 
     if targetPixel is not None:
         cv2.circle(overlay, (int(targetPixel[0]), int(targetPixel[1])), 8, (255, 255, 0), 2)
+
+    for imagePoint in homographyResult.imagePoints:
+        cv2.circle(overlay, (int(imagePoint[0]), int(imagePoint[1])), 3, (0, 180, 255), -1)
 
     return overlay

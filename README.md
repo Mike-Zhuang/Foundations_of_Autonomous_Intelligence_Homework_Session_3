@@ -22,12 +22,13 @@
 - yolo/generate_marker_board.py：生成静态标定板和跨中标记图。
 - yolo/run_deflection_realtime.py：实时测量入口。
 - yolo/run_deflection_offline.py：离线复算入口。
-- yolo/train_midpoint_yolo.py：YOLO 训练入口。
+- yolo/train_midpoint_yolo.py：砝码重量数据采集 + 双任务模型（回归+分类）训练入口。
 - yolo/bridge_ai/config.py：静态标记布局定义与读写。
 - yolo/bridge_ai/geometry.py：ArUco 检测 + 单应矩阵解算。
-- yolo/bridge_ai/detection.py：跨中目标检测（YOLO 主路径 + ArUco 回退）。
+- yolo/bridge_ai/detection.py：跨中目标检测（YOLO 主路径 + ArUco 回退 + 同心圆回退）。
 - yolo/bridge_ai/deflection.py：基线标定与卡尔曼滤波。
 - yolo/bridge_ai/io_utils.py：视频源、CSV、视频写出工具。
+- yolo/bridge_ai/calibration.py：ChArUco 标定、相机内参保存与去畸变。
 
 ## 3. 环境准备
 
@@ -75,6 +76,7 @@ conda run -n fai python yolo/generate_marker_board.py
 - static_marker_layout.json
 - midpoint_fallback_aruco_id42_50mm.png
 - midpoint_circle_marker_50mm.png
+- charuco_5x7_24mm_18mm.png
 - marker_print_notes.txt
 
 静态标记命名规则：
@@ -94,20 +96,21 @@ conda run -n fai python yolo/generate_marker_board.py
 
 单个静态标记边长：40 mm。
 
-以下坐标均为毫米（mm），用于几何映射坐标系（写入 static_marker_layout.json）：
+以下坐标均为毫米（mm），用于几何映射坐标系（写入 static_marker_layout.json）。
+坐标系定义：A4 竖版，原点在左上角，纸面尺寸 210×297 mm。
 
 | ID  | 标记左上角 (x,y) | 边长 | 标记中心 (x,y) |
 | --- | ---------------: | ---: | -------------: |
-| 10  |           (0, 0) |   40 |       (20, 20) |
-| 11  |          (60, 0) |   40 |       (80, 20) |
-| 12  |         (120, 0) |   40 |      (140, 20) |
-| 13  |         (30, 60) |   40 |       (50, 80) |
-| 14  |         (90, 60) |   40 |      (110, 80) |
+| 10  |           (8, 8) |   40 |       (28, 28) |
+| 11  |         (162, 8) |   40 |      (182, 28) |
+| 12  |       (162, 249) |   40 |     (182, 269) |
+| 13  |         (8, 249) |   40 |      (28, 269) |
+| 14  |       (85, 128)  |   40 |     (105, 148) |
 
 说明：
 
-- 这些坐标描述的是标记之间的相对几何关系，不依赖你如何把它们排版到纸上。
-- 但实际贴附时，必须保证每个静态标记的打印边长确实为 40 mm。
+- 该布局采用“四角 + 中心”，几何基线更长，能更好抑制透视误差与拟合不稳定。
+- 贴附时必须保证每个静态标记的打印边长确实为 40 mm，且 A4 打印为 100% 原尺寸。
 
 ## 4.4 跨中目标标记（主目标）
 
@@ -133,7 +136,7 @@ conda run -n fai python yolo/generate_marker_board.py
 
 1. 任一静态标记边长应为 40.0 mm。
 2. 圆形主目标外框边长应为 50.0 mm。
-3. 以 ID10 和 ID11 为例，其左上角水平间距应为 60.0 mm。
+3. 以 ID10 和 ID11 为例，其左上角水平间距应为 154.0 mm。
 
 建议容差：±0.3 mm。若超差，重新打印，直到满足。
 
@@ -185,6 +188,28 @@ conda run -n fai python yolo/generate_marker_board.py
 - 曝光：尽量固定，避免自动曝光频繁跳变。
 - 对焦：锁定在桥梁与标定板平面。
 
+## 6.3 去畸变标定（ChArUco）
+
+实时/离线/训练脚本都支持：
+
+- `--calibration-mode off`：关闭去畸变。
+- `--calibration-mode use`：加载历史标定参数（默认）。
+- `--calibration-mode recalibrate`：现场重标定并写入标定文件。
+
+默认标定文件：`yolo/artifacts/camera_calibration.npz`
+
+推荐 ChArUco 板参数：
+
+- squaresX = 5
+- squaresY = 7
+- squareLength = 24 mm
+- markerLength = 18 mm
+
+重标定时键盘操作：
+
+- `c` 抓取当前姿态样本（建议 25~40 帧）
+- `q` 取消标定
+
 ## 7. 首次连通性检查
 
 先确认 iPhone 连续互通索引：
@@ -214,7 +239,10 @@ conda run -n fai python yolo/run_deflection_realtime.py \
   --target-class midpoint_marker \
   --conf 0.25 \
   --imgsz 640 \
-  --baseline-frames 60
+  --baseline-frames 60 \
+  --calibration-mode use \
+  --calibration-file yolo/artifacts/camera_calibration.npz \
+  --overlay-level debug
 ```
 
 ## 8.2 基线阶段（非常关键）
@@ -237,12 +265,20 @@ conda run -n fai python yolo/run_deflection_realtime.py \
 - tracking:yolo：YOLO 检测并跟踪成功。
 - tracking:yolo-fallback-top1：YOLO 未命中目标类，使用最高置信框。
 - tracking:fallback-aruco：YOLO 未用上，使用 ID42 回退标记。
+- tracking:fallback-circle：YOLO 与 ArUco 回退都未命中时，启用同心圆回退检测。
 - missing:no-static-markers：静态标定点不足，无法解算。
+- missing:low-homography-quality：静态点已识别，但几何质量不达标（RMSE/内点比/点数门控失败）。
 - missing:\*：目标点缺失，当前帧无有效挠度。
 
 退出按键：q。
 
 默认 CSV 输出到 yolo/results/realtime\_时间戳.csv。
+
+`--overlay-level` 说明：
+
+- `minimal`：仅保留核心值，遮挡最少。
+- `balanced`：核心值 + 世界坐标。
+- `debug`：右侧调试面板，显示检测来源、置信度、几何质量、短历史曲线。
 
 ## 9. 离线复算标准流程
 
@@ -256,7 +292,10 @@ conda run -n fai python yolo/run_deflection_offline.py \
   --target-class midpoint_marker \
   --conf 0.25 \
   --imgsz 640 \
-  --baseline-frames 60
+  --baseline-frames 60 \
+  --calibration-mode use \
+  --calibration-file yolo/artifacts/camera_calibration.npz \
+  --overlay-level debug
 ```
 
 ## 9.2 输出内容
@@ -281,79 +320,47 @@ CSV 字段固定为：
 - confidence：检测置信度。
 - status：状态字符串。
 
-## 11. 训练数据采集规范（用于提升精度）
+## 11. 砝码重量数据采集与模型训练
 
-## 11.1 采集目标
+`yolo/train_midpoint_yolo.py` 已重构为“采集 + 训练”一体化入口，不再用于 YOLO 检测模型训练。
 
-目标类别名统一为：midpoint_marker。
+## 11.1 采集流程（交互式）
 
-建议总帧数：200~500（起步），更高更稳。
+1. 启动脚本后，先按 `--calibration-mode` 执行去畸变流程（复用或重标定）。
+2. 命令行输入当前砝码重量（单位 g）。
+3. 在视频窗口按 `s` 开始采集，按 `e` 提前结束，或达到 `--min-valid-frames` 自动结束。
+4. 更换砝码后继续输入下一重量；输入 `done` 结束全部采集。
 
-## 11.2 必须覆盖的变化维度
-
-每个维度都要覆盖，避免训练后泛化失败：
-
-1. 光照：亮光、室内常光、偏暗。
-2. 距离：近、中、远三个档位。
-3. 角度：左偏、正侧、右偏。
-4. 背景：纯色背景、复杂纹理背景。
-5. 挠度状态：空载、小载、中载、较大载荷。
-
-## 11.3 采集硬规则
-
-1. 画面中标记清晰，不可严重运动模糊。
-2. 每段视频尽量保持曝光稳定。
-3. 标注目标不能长期贴边（建议离边缘至少 5% 画面宽度）。
-4. 至少 10% 样本包含部分遮挡情况。
-
-## 11.4 数据组织格式（YOLO 标准）
-
-推荐目录：
-
-```text
-dataset/
-  images/
-    train/
-    val/
-  labels/
-    train/
-    val/
-```
-
-标签文件（同名 .txt）每行格式：
-
-```text
-class_id center_x center_y width height
-```
-
-均为相对归一化坐标（0~1）。
-
-类别映射固定：
-
-- class_id = 0 对应 midpoint_marker。
-
-data.yaml 示例：
-
-```yaml
-path: dataset
-train: images/train
-val: images/val
-names:
-  0: midpoint_marker
-```
-
-## 11.5 训练命令
+## 11.2 训练命令（自动采集 + 自动训练）
 
 ```bash
 conda run -n fai python yolo/train_midpoint_yolo.py \
-  --data path/to/data.yaml \
-  --base-model yolo11n.pt \
-  --epochs 120 \
-  --imgsz 960 \
-  --batch 12
+  --source 0 \
+  --layout yolo/artifacts/static_marker_layout.json \
+  --model yolov8n.pt \
+  --calibration-mode use \
+  --calibration-file yolo/artifacts/camera_calibration.npz \
+  --min-valid-frames 120 \
+  --capture-seconds 8 \
+  --auto-train true \
+  --epochs 220 \
+  --batch-size 16 \
+  --lr 1e-3
 ```
 
-训练后将最佳权重路径用于实时/离线的 --model 参数。
+仅采集不训练（后续手动训练）：
+
+```bash
+conda run -n fai python yolo/train_midpoint_yolo.py --auto-train false
+```
+
+## 11.3 特征与模型
+
+- 采集输出：`weight_dataset_*.csv` + `*.metadata.json`
+- 特征：挠度统计量（mean/std/p05/p50/p95 等）+ 质量指标（confidence/rmse/inlier/usedPoints）+ 稳定性指标
+- 模型：前馈全连接双任务网络（共享 backbone，回归头 + 分类头）
+- 损失：`0.7 * Huber + 0.3 * CrossEntropy`
+- 输出：`best.pth`、`label_map.json`、`metrics.json`
 
 ## 12. 精度验收流程（建议按此提交实验结果）
 

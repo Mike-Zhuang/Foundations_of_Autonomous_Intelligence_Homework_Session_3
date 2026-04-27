@@ -8,6 +8,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from bridge_ai.calibration import loadCalibration, undistortFrame
 from bridge_ai.config import loadLayout
 from bridge_ai.deflection import DeflectionEstimator
 from bridge_ai.detection import MidpointTargetDetector
@@ -28,6 +29,12 @@ def parseArgs() -> argparse.Namespace:
     parser.add_argument("--output-summary", default="", help="输出 summary json 路径")
     parser.add_argument("--output-video", default="", help="输出叠加视频路径")
     parser.add_argument("--preview", action="store_true", help="是否显示预览窗口")
+    parser.add_argument("--overlay-level", choices=["minimal", "balanced", "debug"], default="debug")
+    parser.add_argument("--calibration-mode", choices=["off", "use"], default="use")
+    parser.add_argument("--calibration-file", default="yolo/artifacts/camera_calibration.npz")
+    parser.add_argument("--min-used-points", type=int, default=16)
+    parser.add_argument("--max-rmse", type=float, default=2.6)
+    parser.add_argument("--min-inlier-ratio", type=float, default=0.65)
     return parser.parse_args()
 
 
@@ -66,6 +73,15 @@ def main() -> int:
     )
     estimator = DeflectionEstimator(baselineFrames=args.baseline_frames)
 
+    calibration = None
+    if args.calibration_mode == "use":
+        calibrationPath = Path(args.calibration_file)
+        if calibrationPath.exists():
+            calibration = loadCalibration(calibrationPath)
+            print(f"加载标定参数成功: {calibrationPath} (RMS={calibration.rms:.4f})")
+        else:
+            print(f"未找到标定文件 {calibrationPath}，自动降级为不去畸变。")
+
     capture = openVideoSource(args.video, preferAvfoundation=False)
     fps = capture.get(cv2.CAP_PROP_FPS)
     if fps <= 1.0:
@@ -79,30 +95,42 @@ def main() -> int:
     csvWriter = CsvWriter(outputCsv)
     frameWidth = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
     frameHeight = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    videoWriter = createVideoWriter(outputVideo, frameWidth, frameHeight, fps)
+    panelWidth = 360 if args.overlay_level == "debug" else 0
+    videoWriter = createVideoWriter(outputVideo, frameWidth + panelWidth, frameHeight, fps)
 
     frameIndex = 0
     filteredSeries: list[float] = []
 
     try:
         while True:
-            ok, frame = capture.read()
+            ok, frameRaw = capture.read()
             if not ok:
                 break
+            frame = undistortFrame(frameRaw, calibration) if calibration is not None else frameRaw
 
             timeSec = frameIndex / fps
             frameIndex += 1
 
             homographyResult = solver.solveHomography(frame, layout)
             detection = detector.detect(frame)
+            isLowQuality = (
+                homographyResult.homography is not None
+                and (
+                    homographyResult.usedPointCount < args.min_used_points
+                    or (homographyResult.reprojectionRmsePx is not None and homographyResult.reprojectionRmsePx > args.max_rmse)
+                    or (homographyResult.inlierRatio is not None and homographyResult.inlierRatio < args.min_inlier_ratio)
+                )
+            )
 
             worldPoint = None
-            if homographyResult.homography is not None and detection.centerPixel is not None:
+            if homographyResult.homography is not None and detection.centerPixel is not None and not isLowQuality:
                 worldPoint = solver.pixelToWorld(homographyResult.homography, detection.centerPixel)
 
             statusHint = detection.status
             if homographyResult.homography is None:
                 statusHint = "no-static-markers"
+            elif isLowQuality:
+                statusHint = "low-homography-quality"
 
             state = estimator.update(
                 worldYmm=(worldPoint[1] if worldPoint is not None else None),
@@ -136,12 +164,41 @@ def main() -> int:
                 2,
                 cv2.LINE_AA,
             )
+            if worldPoint is not None and args.overlay_level in ("balanced", "debug"):
+                cv2.putText(
+                    overlay,
+                    f"World(mm): ({worldPoint[0]:.1f}, {worldPoint[1]:.1f})",
+                    (20, 125),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.65,
+                    (200, 240, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+
+            renderFrame = overlay
+            if args.overlay_level == "debug":
+                panel = np.zeros((overlay.shape[0], panelWidth, 3), dtype=np.uint8)
+                panel[:] = (24, 24, 24)
+                lines = [
+                    f"Undistort: {'ON' if calibration is not None else 'OFF'}",
+                    f"H points: {homographyResult.usedPointCount}",
+                    f"H RMSE(px): {homographyResult.reprojectionRmsePx}",
+                    f"H inlier ratio: {homographyResult.inlierRatio}",
+                    f"Detect src: {detection.status}",
+                    f"Detect conf: {detection.confidence:.3f}",
+                ]
+                y = 30
+                for line in lines:
+                    cv2.putText(panel, line, (16, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (235, 235, 235), 1, cv2.LINE_AA)
+                    y += 24
+                renderFrame = np.hstack([overlay, panel])
 
             if videoWriter is not None:
-                videoWriter.write(overlay)
+                videoWriter.write(renderFrame)
 
             if args.preview:
-                cv2.imshow("Bridge Deflection Offline", overlay)
+                cv2.imshow("Bridge Deflection Offline", renderFrame)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
     finally:
