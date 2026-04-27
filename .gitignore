@@ -6,3 +6,7 @@ __pycache__/
 
 yolo/results/
 yolo/artifacts/
+
+# local Word files
+标定点.docx
+~$*.docx

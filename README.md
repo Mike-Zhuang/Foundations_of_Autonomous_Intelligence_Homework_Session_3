@@ -53,7 +53,7 @@ python -c "import cv2; import ultralytics; print('ok')"
 2. 蓝牙和 Wi-Fi 打开。
 3. iPhone 解锁并靠近 Mac。
 
-## 4. 标定板与跨中标记：生成、尺寸、坐标、打印
+## 4. 标定标记生成、尺寸、坐标、打印
 
 ## 4.1 生成命令
 
@@ -67,18 +67,26 @@ conda run -n fai python yolo/generate_marker_board.py
 
 产物：
 
-- static_marker_board_a4_300dpi.png
+- static_marker_id10_40mm.png
+- static_marker_id11_40mm.png
+- static_marker_id12_40mm.png
+- static_marker_id13_40mm.png
+- static_marker_id14_40mm.png
 - static_marker_layout.json
-- midpoint_fallback_aruco_id42.png
+- midpoint_fallback_aruco_id42_50mm.png
 - midpoint_circle_marker_50mm.png
 - marker_print_notes.txt
 
-## 4.2 纸张与打印硬参数（必须）
+静态标记命名规则：
 
-- 纸张：A4 竖版（210 mm × 297 mm）。
+- static*marker_id{ID}*{SIZE}mm.png
+- 示例：static_marker_id10_40mm.png
+
+## 4.2 打印硬参数（必须）
+
 - 打印缩放：100% 原尺寸（禁止适应页面、禁止自动缩放）。
 - 默认分辨率：300 DPI。
-- 默认页边距：15 mm（由脚本参数 --margin-mm 控制）。
+- 每个标记独立打印，方便你单独调节每个标记最终纸面尺寸。
 
 ## 4.3 静态标定点位（5 个 ArUco）
 
@@ -86,24 +94,20 @@ conda run -n fai python yolo/generate_marker_board.py
 
 单个静态标记边长：40 mm。
 
-以下坐标均为毫米（mm）：
+以下坐标均为毫米（mm），用于几何映射坐标系（写入 static_marker_layout.json）：
 
-- 相对坐标系：相对于标定板内部原点（0,0）。
-- 纸面绝对坐标系：相对于 A4 左上角，且包含 15 mm 页边距。
+| ID  | 标记左上角 (x,y) | 边长 | 标记中心 (x,y) |
+| --- | ---------------: | ---: | -------------: |
+| 10  |           (0, 0) |   40 |       (20, 20) |
+| 11  |          (60, 0) |   40 |       (80, 20) |
+| 12  |         (120, 0) |   40 |      (140, 20) |
+| 13  |         (30, 60) |   40 |       (50, 80) |
+| 14  |         (90, 60) |   40 |      (110, 80) |
 
-| ID | 相对左上角 (x,y) | 绝对左上角 (x,y) | 边长 | 绝对中心 (x,y) |
-|---|---:|---:|---:|---:|
-| 10 | (0, 0) | (15, 15) | 40 | (35, 35) |
-| 11 | (60, 0) | (75, 15) | 40 | (95, 35) |
-| 12 | (120, 0) | (135, 15) | 40 | (155, 35) |
-| 13 | (30, 60) | (45, 75) | 40 | (65, 95) |
-| 14 | (90, 60) | (105, 75) | 40 | (125, 95) |
+说明：
 
-布局外接矩形（含标记）范围：
-
-- 左上：(15, 15) mm
-- 右下：(175, 115) mm
-- 占用尺寸：160 mm × 100 mm
+- 这些坐标描述的是标记之间的相对几何关系，不依赖你如何把它们排版到纸上。
+- 但实际贴附时，必须保证每个静态标记的打印边长确实为 40 mm。
 
 ## 4.4 跨中目标标记（主目标）
 
@@ -115,7 +119,7 @@ conda run -n fai python yolo/generate_marker_board.py
 
 ## 4.5 跨中回退标记（备用）
 
-文件：midpoint_fallback_aruco_id42.png
+文件：midpoint_fallback_aruco_id42_50mm.png
 
 - 字典：DICT_5X5_250。
 - 标记 ID：42。
@@ -234,11 +238,11 @@ conda run -n fai python yolo/run_deflection_realtime.py \
 - tracking:yolo-fallback-top1：YOLO 未命中目标类，使用最高置信框。
 - tracking:fallback-aruco：YOLO 未用上，使用 ID42 回退标记。
 - missing:no-static-markers：静态标定点不足，无法解算。
-- missing:*：目标点缺失，当前帧无有效挠度。
+- missing:\*：目标点缺失，当前帧无有效挠度。
 
 退出按键：q。
 
-默认 CSV 输出到 yolo/results/realtime_时间戳.csv。
+默认 CSV 输出到 yolo/results/realtime\_时间戳.csv。
 
 ## 9. 离线复算标准流程
 
