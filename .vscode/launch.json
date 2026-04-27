@@ -15,6 +15,58 @@
         "--source",
         "0"
       ]
+    },
+    {
+      "name": "Generate Marker Board",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/yolo/generate_marker_board.py",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "Realtime Deflection (iPhone Camera)",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/yolo/run_deflection_realtime.py",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "cwd": "${workspaceFolder}",
+      "args": [
+        "--source",
+        "0",
+        "--model",
+        "${workspaceFolder}/yolov8n.pt"
+      ]
+    },
+    {
+      "name": "Offline Deflection Analysis",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/yolo/run_deflection_offline.py",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "cwd": "${workspaceFolder}",
+      "args": [
+        "--video",
+        "${workspaceFolder}/yolo/results/sample.mp4",
+        "--model",
+        "${workspaceFolder}/yolov8n.pt"
+      ]
+    },
+    {
+      "name": "Train Midpoint YOLO",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/yolo/train_midpoint_yolo.py",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "cwd": "${workspaceFolder}",
+      "args": [
+        "--data",
+        "${workspaceFolder}/yolo/data.yaml"
+      ]
     }
   ]
 }
