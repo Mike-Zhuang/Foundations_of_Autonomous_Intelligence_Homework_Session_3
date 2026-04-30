@@ -4,6 +4,7 @@ import argparse
 from collections import deque
 from datetime import datetime
 from pathlib import Path
+import sys
 import time
 
 import cv2
@@ -44,17 +45,53 @@ def formatNumber(value: float | None, digits: int = 3) -> str:
 
 
 def printRealtimeGuide(args: argparse.Namespace) -> None:
-    print("\n================ 实时测量启动说明 ================")
-    print(f"视频源: {args.source}")
-    print(f"去畸变模式: {args.calibration_mode}")
-    print(f"标定文件: {args.calibration_file}")
-    print(f"显示模式: {args.overlay_level}")
-    print("建议操作顺序:")
-    print("1) 若首次实验或机位变化，使用 --calibration-mode recalibrate")
-    print("2) 基线阶段保持空载静止，等待状态从 calibrating-baseline 进入 tracking:*")
-    print("3) 观察右侧调试面板中的 H RMSE / Inlier ratio / Detect src")
-    print("4) 按 q 退出并保存 CSV")
-    print("===============================================\n")
+    print("\n================ 实时测量启动说明 ================", flush=True)
+    print(f"视频源: {args.source}", flush=True)
+    print(f"去畸变模式: {args.calibration_mode}", flush=True)
+    print(f"标定文件: {args.calibration_file}", flush=True)
+    print(f"显示模式: {args.overlay_level}", flush=True)
+    print("建议操作顺序:", flush=True)
+    print("1) 若首次实验或机位变化，使用 --calibration-mode recalibrate", flush=True)
+    print("2) 基线阶段保持空载静止，等待状态从 calibrating-baseline 进入 tracking:*", flush=True)
+    print("3) 观察右侧调试面板中的 H RMSE / Inlier ratio / Detect src", flush=True)
+    print("4) 按 q 退出并保存 CSV", flush=True)
+    print("===============================================\n", flush=True)
+
+
+def localizeStatus(status: str) -> str:
+    if status == "calibrating-baseline":
+        return "基线标定中"
+    if status.startswith("tracking:"):
+        key = status.split(":", 1)[1]
+        mapping = {
+            "yolo": "YOLO 跟踪",
+            "yolo-fallback-top1": "YOLO 最高置信框回退",
+            "fallback-aruco": "Aruco 回退",
+            "fallback-circle": "同心圆回退",
+        }
+        return f"跟踪中：{mapping.get(key, key)}"
+    if status.startswith("missing:"):
+        key = status.split(":", 1)[1]
+        mapping = {
+            "no-static-markers": "未检测到足够静态标记",
+            "low-homography-quality": "几何质量不足（重投影/内点比/点数未达标）",
+            "yolo-no-target": "YOLO 未检测到目标",
+            "fallback-no-target": "回退检测也未找到目标",
+        }
+        return f"缺失：{mapping.get(key, key)}"
+    return status
+
+
+def localizeDetectionSource(status: str) -> str:
+    mapping = {
+        "yolo": "YOLO",
+        "yolo-fallback-top1": "YOLO最高置信框",
+        "fallback-aruco": "Aruco回退",
+        "fallback-circle": "同心圆回退",
+        "yolo-no-target": "YOLO未检出",
+        "fallback-no-target": "回退未检出",
+    }
+    return mapping.get(status, status)
 
 
 def resolveCalibration(args: argparse.Namespace, capture: cv2.VideoCapture) -> CameraCalibration | None:
@@ -118,6 +155,8 @@ def attachDebugPanel(frame: np.ndarray, lines: list[str], historyMm: list[float]
 
 
 def main() -> int:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)
     args = parseArgs()
     printRealtimeGuide(args)
 
@@ -241,19 +280,20 @@ def main() -> int:
                 2,
                 cv2.LINE_AA,
             )
+            statusCn = localizeStatus(state.status)
             cv2.putText(
                 overlay,
-                f"Status: {state.status}",
+                f"状态: {statusCn}",
                 (20, 125),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.65,
+                0.6,
                 (255, 255, 0),
                 2,
                 cv2.LINE_AA,
             )
             cv2.putText(
                 overlay,
-                "Press q to quit",
+                "按 q 退出",
                 (20, frame.shape[0] - 20),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.7,
@@ -264,15 +304,15 @@ def main() -> int:
 
             if args.overlay_level == "debug":
                 lines = [
-                    f"Undistort: {'ON' if calibration is not None else 'OFF'}",
-                    f"Calibration RMS: {formatNumber(calibration.rms if calibration else None, 4)}",
-                    f"Found IDs: {homographyResult.foundMarkerIds}",
-                    f"Used points: {homographyResult.usedPointCount}",
-                    f"H RMSE(px): {formatNumber(homographyResult.reprojectionRmsePx, 3)}",
-                    f"Inlier ratio: {formatNumber(homographyResult.inlierRatio, 3)}",
-                    f"Detect src: {detection.status}",
-                    f"Detect conf: {detection.confidence:.3f}",
-                    f"Target pixel: {detection.centerPixel}",
+                    f"去畸变: {'开启' if calibration is not None else '关闭'}",
+                    f"标定 RMS: {formatNumber(calibration.rms if calibration else None, 4)}",
+                    f"静态ID: {homographyResult.foundMarkerIds}",
+                    f"有效点数: {homographyResult.usedPointCount}",
+                    f"重投影RMSE(px): {formatNumber(homographyResult.reprojectionRmsePx, 3)}",
+                    f"内点比例: {formatNumber(homographyResult.inlierRatio, 3)}",
+                    f"检测来源: {localizeDetectionSource(detection.status)}",
+                    f"检测置信度: {detection.confidence:.3f}",
+                    f"目标像素: {detection.centerPixel}",
                 ]
                 renderFrame = attachDebugPanel(overlay, lines, list(historyMm))
             else:

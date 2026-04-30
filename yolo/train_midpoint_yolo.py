@@ -55,6 +55,42 @@ class SampleWindow:
     usedPoints: list[int]
 
 
+def localizeStatus(status: str) -> str:
+    if status == "calibrating-baseline":
+        return "基线标定中"
+    if status.startswith("tracking:"):
+        key = status.split(":", 1)[1]
+        mapping = {
+            "yolo": "YOLO 跟踪",
+            "yolo-fallback-top1": "YOLO 最高置信框回退",
+            "fallback-aruco": "Aruco 回退",
+            "fallback-circle": "同心圆回退",
+        }
+        return f"跟踪中：{mapping.get(key, key)}"
+    if status.startswith("missing:"):
+        key = status.split(":", 1)[1]
+        mapping = {
+            "no-static-markers": "未检测到足够静态标记",
+            "low-homography-quality": "几何质量不足（重投影/内点比/点数未达标）",
+            "yolo-no-target": "YOLO 未检测到目标",
+            "fallback-no-target": "回退检测也未找到目标",
+        }
+        return f"缺失：{mapping.get(key, key)}"
+    return status
+
+
+def localizeDetectionSource(status: str) -> str:
+    mapping = {
+        "yolo": "YOLO",
+        "yolo-fallback-top1": "YOLO最高置信框",
+        "fallback-aruco": "Aruco回退",
+        "fallback-circle": "同心圆回退",
+        "yolo-no-target": "YOLO未检出",
+        "fallback-no-target": "回退未检出",
+    }
+    return mapping.get(status, status)
+
+
 def printCollectorGuide(args: argparse.Namespace) -> None:
     print("\n================ 采集与训练启动说明 ================")
     print(f"视频源: {args.source}")
@@ -333,7 +369,7 @@ def main() -> int:
     capture = openVideoSource(args.source, preferAvfoundation=True)
     calibration = resolveCalibration(args, capture)
 
-    windowName = "Weight Dataset Collector"
+    windowName = "砝码重量采集器"
     cv2.namedWindow(windowName, cv2.WINDOW_NORMAL)
     fps = capture.get(cv2.CAP_PROP_FPS)
     if fps <= 1.0:
@@ -414,7 +450,7 @@ def main() -> int:
 
                 cv2.putText(
                     overlay,
-                    f"Weight(g): {weightG:.3f}",
+                    f"重量(g): {weightG:.3f}",
                     (20, 65),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.75,
@@ -424,7 +460,7 @@ def main() -> int:
                 )
                 cv2.putText(
                     overlay,
-                    f"Status: {state.status}",
+                    f"状态: {localizeStatus(state.status)}",
                     (20, 95),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.65,
@@ -434,7 +470,7 @@ def main() -> int:
                 )
                 cv2.putText(
                     overlay,
-                    f"Valid Frames: {validCount}/{args.min_valid_frames}",
+                    f"有效帧: {validCount}/{args.min_valid_frames}",
                     (20, 125),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.65,
@@ -442,7 +478,7 @@ def main() -> int:
                     2,
                     cv2.LINE_AA,
                 )
-                helpText = "Press S to start capture, E to end, Q to abort script"
+                helpText = "按 S 开始采集，按 E 结束，按 Q 中止程序"
                 cv2.putText(
                     overlay,
                     helpText,
@@ -458,14 +494,14 @@ def main() -> int:
                     panel = np.zeros((overlay.shape[0], 360, 3), dtype=np.uint8)
                     panel[:] = (24, 24, 24)
                     lines = [
-                        f"Undistort: {'ON' if calibration else 'OFF'}",
-                        f"Detect src: {detection.status}",
-                        f"Detect conf: {detection.confidence:.3f}",
-                        f"H points: {homographyResult.usedPointCount}",
-                        f"H RMSE(px): {homographyResult.reprojectionRmsePx}",
-                        f"H inlier ratio: {homographyResult.inlierRatio}",
-                        f"Baseline(mm): {state.baselineMm}",
-                        f"Deflection(mm): {state.filteredMm}",
+                        f"去畸变: {'开启' if calibration else '关闭'}",
+                        f"检测来源: {localizeDetectionSource(detection.status)}",
+                        f"检测置信度: {detection.confidence:.3f}",
+                        f"有效点数: {homographyResult.usedPointCount}",
+                        f"重投影RMSE(px): {homographyResult.reprojectionRmsePx}",
+                        f"内点比例: {homographyResult.inlierRatio}",
+                        f"基线(mm): {state.baselineMm}",
+                        f"挠度(mm): {state.filteredMm}",
                     ]
                     y = 30
                     for line in lines:

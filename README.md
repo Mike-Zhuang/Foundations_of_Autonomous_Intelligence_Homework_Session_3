@@ -64,6 +64,12 @@ python -c "import cv2; import ultralytics; print('ok')"
 conda run -n fai python yolo/generate_marker_board.py
 ```
 
+提示：`conda run` 默认可能缓存输出。若希望在运行中实时看到命令行提示，请用：
+
+```bash
+conda run --no-capture-output -n fai python ...
+```
+
 默认输出目录：yolo/artifacts
 
 产物：
@@ -262,7 +268,7 @@ conda run -n fai python yolo/test.py --source 2
 ## 8.1 启动命令
 
 ```bash
-conda run -n fai python yolo/run_deflection_realtime.py \
+conda run --no-capture-output -n fai python yolo/run_deflection_realtime.py \
   --source 0 \
   --model yolov8n.pt \
   --layout yolo/artifacts/static_marker_layout.json \
@@ -278,7 +284,7 @@ conda run -n fai python yolo/run_deflection_realtime.py \
 ### 8.1.1 首次实验推荐命令（会重标定）
 
 ```bash
-conda run -n fai python yolo/run_deflection_realtime.py \
+conda run --no-capture-output -n fai python yolo/run_deflection_realtime.py \
   --source 0 \
   --calibration-mode recalibrate \
   --overlay-level debug
@@ -287,7 +293,7 @@ conda run -n fai python yolo/run_deflection_realtime.py \
 ### 8.1.2 后续重复实验推荐命令（复用标定）
 
 ```bash
-conda run -n fai python yolo/run_deflection_realtime.py \
+conda run --no-capture-output -n fai python yolo/run_deflection_realtime.py \
   --source 0 \
   --calibration-mode use \
   --calibration-file yolo/artifacts/camera_calibration.npz \
@@ -319,6 +325,8 @@ conda run -n fai python yolo/run_deflection_realtime.py \
 - missing:low-homography-quality：静态点已识别，但几何质量不达标（RMSE/内点比/点数门控失败）。
 - missing:\*：目标点缺失，当前帧无有效挠度。
 
+窗口显示已汉化：你会看到“状态: 缺失：几何质量不足...”这类中文提示；CSV 里仍保留英文状态码，便于后处理与统计。
+
 退出按键：q。
 
 默认 CSV 输出到 yolo/results/realtime\_时间戳.csv。
@@ -334,7 +342,7 @@ conda run -n fai python yolo/run_deflection_realtime.py \
 ## 9.1 启动命令
 
 ```bash
-conda run -n fai python yolo/run_deflection_offline.py \
+conda run --no-capture-output -n fai python yolo/run_deflection_offline.py \
   --video path/to/your_video.mp4 \
   --model yolov8n.pt \
   --layout yolo/artifacts/static_marker_layout.json \
@@ -389,7 +397,7 @@ CSV 字段固定为：
 ## 11.2 训练命令（自动采集 + 自动训练）
 
 ```bash
-conda run -n fai python yolo/train_midpoint_yolo.py \
+conda run --no-capture-output -n fai python yolo/train_midpoint_yolo.py \
   --source 0 \
   --layout yolo/artifacts/static_marker_layout.json \
   --model yolov8n.pt \
@@ -406,7 +414,7 @@ conda run -n fai python yolo/train_midpoint_yolo.py \
 仅采集不训练（后续手动训练）：
 
 ```bash
-conda run -n fai python yolo/train_midpoint_yolo.py --auto-train false
+conda run --no-capture-output -n fai python yolo/train_midpoint_yolo.py --auto-train false
 ```
 
 ## 11.3 特征与模型
