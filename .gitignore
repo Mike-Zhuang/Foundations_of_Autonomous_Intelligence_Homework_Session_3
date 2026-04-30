@@ -10,3 +10,32 @@ yolo/artifacts/
 # local Word files
 标定点.docx
 ~$*.docx
+*.docx
+
+# local Excel files
+~$*.xlsx
+*.xlsx
+
+# local PPT files
+~$*.pptx
+*.pptx
+
+# local PDF files
+~$*.pdf
+*.pdf
+
+# local image files
+~$*.jpg
+~$*.jpeg
+~$*.png
+~$*.gif
+~$*.bmp
+~$*.tiff
+~$*.tif
+~$*.psd
+~$*.raw
+~$*.webp
+~$*.svg
+~$*.ai
+~$*.eps
+~$*.ico

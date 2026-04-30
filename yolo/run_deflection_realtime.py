@@ -43,6 +43,20 @@ def formatNumber(value: float | None, digits: int = 3) -> str:
     return f"{value:.{digits}f}"
 
 
+def printRealtimeGuide(args: argparse.Namespace) -> None:
+    print("\n================ 实时测量启动说明 ================")
+    print(f"视频源: {args.source}")
+    print(f"去畸变模式: {args.calibration_mode}")
+    print(f"标定文件: {args.calibration_file}")
+    print(f"显示模式: {args.overlay_level}")
+    print("建议操作顺序:")
+    print("1) 若首次实验或机位变化，使用 --calibration-mode recalibrate")
+    print("2) 基线阶段保持空载静止，等待状态从 calibrating-baseline 进入 tracking:*")
+    print("3) 观察右侧调试面板中的 H RMSE / Inlier ratio / Detect src")
+    print("4) 按 q 退出并保存 CSV")
+    print("===============================================\n")
+
+
 def resolveCalibration(args: argparse.Namespace, capture: cv2.VideoCapture) -> CameraCalibration | None:
     calibrationPath = Path(args.calibration_file)
     if args.calibration_mode == "off":
@@ -105,6 +119,7 @@ def attachDebugPanel(frame: np.ndarray, lines: list[str], historyMm: list[float]
 
 def main() -> int:
     args = parseArgs()
+    printRealtimeGuide(args)
 
     layoutPath = Path(args.layout)
     layout = loadLayout(layoutPath if layoutPath.exists() else None)

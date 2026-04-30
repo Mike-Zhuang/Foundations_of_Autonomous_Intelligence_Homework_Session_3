@@ -210,6 +210,36 @@ conda run -n fai python yolo/generate_marker_board.py
 - `c` 抓取当前姿态样本（建议 25~40 帧）
 - `q` 取消标定
 
+## 6.4 什么时候要重标定（最重要）
+
+按下面规则判断即可：
+
+1. **第一次做实验**：必须重标定（`--calibration-mode recalibrate`）。
+2. **相机位置变了**（高度、角度、左右位置变化）：重标定。
+3. **相机参数变了**（分辨率、变焦、对焦策略明显变化）：重标定。
+4. **换了设备**（换手机/换摄像头）：重标定。
+5. **仅重复同机位同参数实验**：直接复用（`--calibration-mode use`）。
+
+一句话版：
+
+- 不确定就先重标定一次；
+- 确定机位和参数都没变就用 `use`。
+
+## 6.5 ChArUco 尺寸不要弄错
+
+`squareLength=24mm` 与 `markerLength=18mm` 说的是**单个格子内部尺寸**，不是整张图尺寸。
+
+5x7 板整板尺寸应为：
+
+- 宽 = `5 × 24 = 120 mm`
+- 高 = `7 × 24 = 168 mm`
+
+打印时请确保：
+
+- 100% 原始尺寸；
+- 禁止“适应页面/自动缩放”；
+- 打印后用尺量：任意方格边长约 24mm、黑块边长约 18mm。
+
 ## 7. 首次连通性检查
 
 先确认 iPhone 连续互通索引：
@@ -243,6 +273,25 @@ conda run -n fai python yolo/run_deflection_realtime.py \
   --calibration-mode use \
   --calibration-file yolo/artifacts/camera_calibration.npz \
   --overlay-level debug
+```
+
+### 8.1.1 首次实验推荐命令（会重标定）
+
+```bash
+conda run -n fai python yolo/run_deflection_realtime.py \
+  --source 0 \
+  --calibration-mode recalibrate \
+  --overlay-level debug
+```
+
+### 8.1.2 后续重复实验推荐命令（复用标定）
+
+```bash
+conda run -n fai python yolo/run_deflection_realtime.py \
+  --source 0 \
+  --calibration-mode use \
+  --calibration-file yolo/artifacts/camera_calibration.npz \
+  --overlay-level balanced
 ```
 
 ## 8.2 基线阶段（非常关键）
@@ -331,6 +380,12 @@ CSV 字段固定为：
 3. 在视频窗口按 `s` 开始采集，按 `e` 提前结束，或达到 `--min-valid-frames` 自动结束。
 4. 更换砝码后继续输入下一重量；输入 `done` 结束全部采集。
 
+避免混乱的小建议：
+
+- 每个重量建议采集 2~3 轮；
+- 每轮开始前等画面状态稳定到 `tracking:*` 再按 `s`；
+- 若出现 `missing:low-homography-quality`，先调整机位/光照再重采，不要硬采。
+
 ## 11.2 训练命令（自动采集 + 自动训练）
 
 ```bash
@@ -418,6 +473,14 @@ conda run -n fai python yolo/train_midpoint_yolo.py --auto-train false
 6. 保存 CSV（和可选视频）。
 7. 用离线脚本复算并导出 summary。
 8. 按第 12 节做精度验收并记录误差。
+
+## 15. 一页式快速流程（建议直接照做）
+
+1. 生成并打印标记（含 ChArUco 板）。
+2. 相机固定好后，先跑一次 `recalibrate`。
+3. 再跑实时脚本观察状态和调试面板，确认识别稳定。
+4. 进入采集训练脚本，按“输入重量 -> 按 s 采集 -> done 结束”循环。
+5. 若 `--auto-train true`，程序自动训练并输出 `best.pth` 与 `metrics.json`。
 
 ---
 

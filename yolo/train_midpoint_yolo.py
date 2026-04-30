@@ -55,6 +55,23 @@ class SampleWindow:
     usedPoints: list[int]
 
 
+def printCollectorGuide(args: argparse.Namespace) -> None:
+    print("\n================ 采集与训练启动说明 ================")
+    print(f"视频源: {args.source}")
+    print(f"去畸变模式: {args.calibration_mode}")
+    print(f"自动训练: {args.auto_train}")
+    print(f"最少有效帧: {args.min_valid_frames}")
+    print(f"单轮最长时长: {args.capture_seconds}s")
+    print("采集时请按:")
+    print("- s: 开始采集当前重量")
+    print("- e: 提前结束当前重量")
+    print("- q: 中止整个程序")
+    print("命令行输入重量时:")
+    print("- 输入数字表示克(g)，例如 200")
+    print("- 输入 done 结束采集并进入训练/导出")
+    print("===============================================\n")
+
+
 def resolveCalibration(args: argparse.Namespace, capture: cv2.VideoCapture) -> CameraCalibration | None:
     calibrationPath = Path(args.calibration_file)
     if args.calibration_mode == "off":
@@ -301,6 +318,7 @@ def parseWeightInput(text: str) -> Optional[float]:
 
 def main() -> int:
     args = parseArgs()
+    printCollectorGuide(args)
     layoutPath = Path(args.layout)
     layout = loadLayout(layoutPath if layoutPath.exists() else None)
 
