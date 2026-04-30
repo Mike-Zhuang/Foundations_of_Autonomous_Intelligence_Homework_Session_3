@@ -163,3 +163,41 @@ def estimateMarkerPoseTvec(
 
     tx, ty, tz = tvec.reshape(3).tolist()
     return float(tx), float(ty), float(tz)
+
+
+def estimateStaticBoardPose(
+    homographyResult: HomographyResult,
+    cameraMatrix: np.ndarray,
+) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    if len(homographyResult.imagePoints) < 8 or len(homographyResult.worldPoints) < 8:
+        return None
+
+    objectPoints = np.asarray(
+        [(xWorld, yWorld, 0.0) for xWorld, yWorld in homographyResult.worldPoints],
+        dtype=np.float32,
+    ).reshape(-1, 1, 3)
+    imagePoints = np.asarray(homographyResult.imagePoints, dtype=np.float32).reshape(-1, 1, 2)
+    distCoeffs = np.zeros((5, 1), dtype=np.float64)
+
+    ok, rvec, tvec = cv2.solvePnP(
+        objectPoints,
+        imagePoints,
+        cameraMatrix,
+        distCoeffs,
+        flags=cv2.SOLVEPNP_ITERATIVE,
+    )
+    if not ok:
+        return None
+    return rvec, tvec
+
+
+def cameraPointToStaticWorld(
+    cameraPointMm: Tuple[float, float, float],
+    staticBoardPose: Tuple[np.ndarray, np.ndarray],
+) -> Tuple[float, float, float]:
+    rvec, tvec = staticBoardPose
+    rotation, _ = cv2.Rodrigues(rvec)
+    cameraPoint = np.asarray(cameraPointMm, dtype=np.float64).reshape(3, 1)
+    worldPoint = rotation.T @ (cameraPoint - tvec.reshape(3, 1))
+    xWorld, yWorld, zWorld = worldPoint.reshape(3).tolist()
+    return float(xWorld), float(yWorld), float(zWorld)

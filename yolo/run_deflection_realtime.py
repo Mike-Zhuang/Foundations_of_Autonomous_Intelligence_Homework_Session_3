@@ -14,7 +14,13 @@ from bridge_ai.calibration import CameraCalibration, loadCalibration, runCharuco
 from bridge_ai.config import loadLayout
 from bridge_ai.deflection import DeflectionEstimator
 from bridge_ai.detection import MidpointTargetDetector
-from bridge_ai.geometry import ArucoStaticSolver, drawOverlay, estimateMarkerPoseTvec
+from bridge_ai.geometry import (
+    ArucoStaticSolver,
+    cameraPointToStaticWorld,
+    drawOverlay,
+    estimateMarkerPoseTvec,
+    estimateStaticBoardPose,
+)
 from bridge_ai.io_utils import CsvWriter, createVideoWriter, openVideoSource
 
 
@@ -33,7 +39,11 @@ def parseArgs() -> argparse.Namespace:
     parser.add_argument("--calibration-file", default="yolo/artifacts/camera_calibration.npz")
     parser.add_argument("--overlay-level", choices=["minimal", "balanced", "debug"], default="debug")
     parser.add_argument("--start-mode", choices=["manual", "auto"], default="manual", help="manual: 按 s 才开始基线")
-    parser.add_argument("--measurement-method", choices=["target-pnp", "homography"], default="target-pnp")
+    parser.add_argument(
+        "--measurement-method",
+        choices=["static-compensated-pnp", "target-pnp", "homography"],
+        default="static-compensated-pnp",
+    )
     parser.add_argument("--target-marker-size", type=float, default=50.0, help="ID42 目标标记边长，单位 mm")
     parser.add_argument("--min-used-points", type=int, default=16)
     parser.add_argument("--max-rmse", type=float, default=2.6)
@@ -237,13 +247,18 @@ def main() -> int:
 
             worldPoint = None
             poseTvec = None
+            staticBoardPose = None
+            compensatedWorldPoint = None
             measurementYmm = None
             measurementMethod = "none"
             if homographyResult.homography is not None and detection.centerPixel is not None and not isLowQuality:
                 worldPoint = solver.pixelToWorld(homographyResult.homography, detection.centerPixel)
 
+            if calibration is not None and homographyResult.usedPointCount >= args.min_used_points and not isLowQuality:
+                staticBoardPose = estimateStaticBoardPose(homographyResult, calibration.cameraMatrix)
+
             if (
-                args.measurement_method == "target-pnp"
+                args.measurement_method in ("static-compensated-pnp", "target-pnp")
                 and calibration is not None
                 and detection.markerCorners is not None
             ):
@@ -253,8 +268,13 @@ def main() -> int:
                     cameraMatrix=calibration.cameraMatrix,
                 )
                 if poseTvec is not None:
-                    measurementYmm = poseTvec[1]
-                    measurementMethod = "target-pnp"
+                    if args.measurement_method == "static-compensated-pnp" and staticBoardPose is not None:
+                        compensatedWorldPoint = cameraPointToStaticWorld(poseTvec, staticBoardPose)
+                        measurementYmm = compensatedWorldPoint[1]
+                        measurementMethod = "static-compensated-pnp"
+                    else:
+                        measurementYmm = poseTvec[1]
+                        measurementMethod = "target-pnp"
 
             if measurementYmm is None and worldPoint is not None:
                 measurementYmm = worldPoint[1]
@@ -376,6 +396,7 @@ def main() -> int:
                     f"Measure: {measurementMethod}",
                     f"Target pixel: {detection.centerPixel}",
                     f"Target tvec(mm): {poseTvec}",
+                    f"Target world(mm): {compensatedWorldPoint}",
                 ]
                 renderFrame = attachDebugPanel(overlay, lines, list(historyMm))
             else:

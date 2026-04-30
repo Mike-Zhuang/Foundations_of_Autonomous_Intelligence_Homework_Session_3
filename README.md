@@ -284,7 +284,7 @@ conda run --no-capture-output -n fai python yolo/run_deflection_realtime.py \
   --imgsz 640 \
   --baseline-frames 60 \
   --start-mode manual \
-  --measurement-method target-pnp \
+  --measurement-method static-compensated-pnp \
   --calibration-mode use \
   --calibration-file yolo/artifacts/camera_calibration.npz \
   --overlay-level debug
@@ -296,7 +296,7 @@ conda run --no-capture-output -n fai python yolo/run_deflection_realtime.py \
 conda run --no-capture-output -n fai python yolo/run_deflection_realtime.py \
   --source 0 \
   --start-mode manual \
-  --measurement-method target-pnp \
+  --measurement-method static-compensated-pnp \
   --calibration-mode recalibrate \
   --overlay-level debug
 ```
@@ -307,7 +307,7 @@ conda run --no-capture-output -n fai python yolo/run_deflection_realtime.py \
 conda run --no-capture-output -n fai python yolo/run_deflection_realtime.py \
   --source 0 \
   --start-mode manual \
-  --measurement-method target-pnp \
+  --measurement-method static-compensated-pnp \
   --calibration-mode use \
   --calibration-file yolo/artifacts/camera_calibration.npz \
   --overlay-level balanced
@@ -348,12 +348,13 @@ conda run --no-capture-output -n fai python yolo/run_deflection_realtime.py \
 - `balanced`：核心值 + 世界坐标（**不显示右侧灰色调试面板**）。
 - `debug`：显示右侧灰色调试面板，包含检测来源、置信度、几何质量、短历史曲线。
 - `start-mode`：`manual` 需按 `s` 开始基线，`auto` 启动即开始。
-- `measurement-method`：推荐 `target-pnp`。它使用 ID42 目标标记的 50mm 已知尺寸估计相机坐标位移，更适合跨中目标不在静态标定板同一平面的场景。
+- `measurement-method`：推荐 `static-compensated-pnp`。它用 ID42 的 50mm 已知尺寸估计目标位置，再用 5 个静态点估计相机相对静态背景的姿态，从而补偿轻微相机运动。
 
 重要算法说明：
 
 - `homography` 方法假设跨中目标与 5 个静态标记在同一平面；若目标贴在桥上、静态标记贴在后方背板上，两者不共面，真实 40mm 位移可能只被算成几 mm。
-- `target-pnp` 方法依赖相机去畸变标定和 ID42 目标标记边长（默认 50mm），当前版本推荐用于实测挠度。
+- `target-pnp` 方法只使用 ID42 与相机内参，适合相机完全固定的情况。
+- `static-compensated-pnp` 是当前推荐方法：ID42 负责主测量，5 个 40mm 静态点负责估计相机/背景参考姿态，帮助抵消轻微相机晃动。
 
 说明：OpenCV 默认 `cv2.putText` 字体在很多环境下不支持中文，窗口里可能显示 `????`。  
 因此当前版本将**窗口叠加文字**统一为英文短语（避免乱码），命令行提示与 README 保持中文说明。
