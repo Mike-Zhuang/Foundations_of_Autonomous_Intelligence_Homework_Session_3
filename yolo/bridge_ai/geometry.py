@@ -132,3 +132,34 @@ def drawOverlay(frame: np.ndarray, homographyResult: HomographyResult, targetPix
         cv2.circle(overlay, (int(imagePoint[0]), int(imagePoint[1])), 3, (0, 180, 255), -1)
 
     return overlay
+
+
+def estimateMarkerPoseTvec(
+    markerCorners: np.ndarray,
+    markerSizeMm: float,
+    cameraMatrix: np.ndarray,
+) -> Optional[Tuple[float, float, float]]:
+    halfSize = markerSizeMm * 0.5
+    objectPoints = np.asarray(
+        [
+            (-halfSize, -halfSize, 0.0),
+            (halfSize, -halfSize, 0.0),
+            (halfSize, halfSize, 0.0),
+            (-halfSize, halfSize, 0.0),
+        ],
+        dtype=np.float32,
+    )
+    imagePoints = np.asarray(markerCorners, dtype=np.float32).reshape(4, 2)
+    distCoeffs = np.zeros((5, 1), dtype=np.float64)
+    ok, _, tvec = cv2.solvePnP(
+        objectPoints,
+        imagePoints,
+        cameraMatrix,
+        distCoeffs,
+        flags=cv2.SOLVEPNP_ITERATIVE,
+    )
+    if not ok:
+        return None
+
+    tx, ty, tz = tvec.reshape(3).tolist()
+    return float(tx), float(ty), float(tz)

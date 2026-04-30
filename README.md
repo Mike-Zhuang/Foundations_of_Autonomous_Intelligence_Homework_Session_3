@@ -25,7 +25,7 @@
 - yolo/train_midpoint_yolo.py：砝码重量数据采集 + 双任务模型（回归+分类）训练入口。
 - yolo/bridge_ai/config.py：静态标记布局定义与读写。
 - yolo/bridge_ai/geometry.py：ArUco 检测 + 单应矩阵解算。
-- yolo/bridge_ai/detection.py：跨中目标检测（YOLO 主路径 + ArUco 回退 + 同心圆回退）。
+- yolo/bridge_ai/detection.py：跨中目标检测（YOLO 主路径 + ArUco ID42 回退）。
 - yolo/bridge_ai/deflection.py：基线标定与卡尔曼滤波。
 - yolo/bridge_ai/io_utils.py：视频源、CSV、视频写出工具。
 - yolo/bridge_ai/calibration.py：ChArUco 标定、相机内参保存与去畸变。
@@ -81,7 +81,7 @@ conda run --no-capture-output -n fai python ...
 - static_marker_id14_40mm.png
 - static_marker_layout.json
 - midpoint_fallback_aruco_id42_50mm.png
-- midpoint_circle_marker_50mm.png
+- midpoint_circle_marker_50mm.png（已弃用，仅保留文件）
 - charuco_5x7_24mm_18mm.png
 - marker_print_notes.txt
 
@@ -118,30 +118,25 @@ conda run --no-capture-output -n fai python ...
 - 该布局采用“四角 + 中心”，几何基线更长，能更好抑制透视误差与拟合不稳定。
 - 贴附时必须保证每个静态标记的打印边长确实为 40 mm，且 A4 打印为 100% 原尺寸。
 
-## 4.4 跨中目标标记（主目标）
-
-文件：midpoint_circle_marker_50mm.png
-
-- 外框尺寸：50 mm × 50 mm。
-- 黑色外圆直径：约 35 mm。
-- 白色内圆直径：约 12 mm（脚本按像素整数近似）。
-
-## 4.5 跨中回退标记（备用）
+## 4.4 跨中目标标记（当前主目标）
 
 文件：midpoint_fallback_aruco_id42_50mm.png
 
-- 字典：DICT_5X5_250。
-- 标记 ID：42。
-- 边长：50 mm。
+- 字典：DICT_5X5_250
+- 标记 ID：42
+- 边长：50 mm
+- 当前版本始终使用该标记作为跨中目标回退检测主方案。
 
-当 YOLO 模型缺失、加载失败或未检出目标时，系统会自动尝试该回退标记。
+## 4.5 跨中回退标记（备用）
+
+同心圆文件 `midpoint_circle_marker_50mm.png` 目前不参与检测流程，仅作为历史产物保留。
 
 ## 4.6 打印后实物验收（必须执行）
 
 使用游标卡尺或钢尺逐项核验：
 
 1. 任一静态标记边长应为 40.0 mm。
-2. 圆形主目标外框边长应为 50.0 mm。
+2. ID42 目标标记边长应为 50.0 mm。
 3. 以 ID10 和 ID11 为例，其左上角水平间距应为 154.0 mm。
 
 建议容差：±0.3 mm。若超差，重新打印，直到满足。
@@ -214,7 +209,19 @@ conda run --no-capture-output -n fai python ...
 重标定时键盘操作：
 
 - `c` 抓取当前姿态样本（建议 25~40 帧）
+- `s` 开始采样（未按前不会采样）
+- `a` 开启/关闭自动采样（检测到足够角点时自动抓取）
 - `q` 取消标定
+
+注意：按键必须在**视频窗口**里按，不要在命令行里输入 `c`。  
+若窗口提示“有效 ChArUco 角点不足”，优先做这三件事：
+
+1. 让标定板在画面中更大（至少占画面高度 40% 左右）。
+2. 降低反光，保证棋盘黑白对比明显。
+3. 角度不要过斜（先正对，再逐步增加倾斜角）。
+
+标定板不需要充满全屏，建议占画面高度约 **35%~70%**。  
+关键是：同一轮标定里要覆盖多个距离与角度，而不是只在一个位置采样。
 
 ## 6.4 什么时候要重标定（最重要）
 
@@ -276,6 +283,8 @@ conda run --no-capture-output -n fai python yolo/run_deflection_realtime.py \
   --conf 0.25 \
   --imgsz 640 \
   --baseline-frames 60 \
+  --start-mode manual \
+  --measurement-method target-pnp \
   --calibration-mode use \
   --calibration-file yolo/artifacts/camera_calibration.npz \
   --overlay-level debug
@@ -286,6 +295,8 @@ conda run --no-capture-output -n fai python yolo/run_deflection_realtime.py \
 ```bash
 conda run --no-capture-output -n fai python yolo/run_deflection_realtime.py \
   --source 0 \
+  --start-mode manual \
+  --measurement-method target-pnp \
   --calibration-mode recalibrate \
   --overlay-level debug
 ```
@@ -295,6 +306,8 @@ conda run --no-capture-output -n fai python yolo/run_deflection_realtime.py \
 ```bash
 conda run --no-capture-output -n fai python yolo/run_deflection_realtime.py \
   --source 0 \
+  --start-mode manual \
+  --measurement-method target-pnp \
   --calibration-mode use \
   --calibration-file yolo/artifacts/camera_calibration.npz \
   --overlay-level balanced
@@ -302,6 +315,7 @@ conda run --no-capture-output -n fai python yolo/run_deflection_realtime.py \
 
 ## 8.2 基线阶段（非常关键）
 
+- `--start-mode manual` 时，先按 `s` 才会进入基线阶段。
 - 前 baseline-frames 帧处于 calibrating-baseline 状态。
 - 此阶段必须无载荷、无外力、无触碰。
 - 基线值 baselineMm 取这些帧 worldYmm 的中位数。
@@ -317,15 +331,12 @@ conda run --no-capture-output -n fai python yolo/run_deflection_realtime.py \
 状态含义：
 
 - calibrating-baseline：正在标定基线。
+- waiting-start：等待按 `s` 开始基线（仅 manual 模式）。
 - tracking:yolo：YOLO 检测并跟踪成功。
-- tracking:yolo-fallback-top1：YOLO 未命中目标类，使用最高置信框。
 - tracking:fallback-aruco：YOLO 未用上，使用 ID42 回退标记。
-- tracking:fallback-circle：YOLO 与 ArUco 回退都未命中时，启用同心圆回退检测。
 - missing:no-static-markers：静态标定点不足，无法解算。
 - missing:low-homography-quality：静态点已识别，但几何质量不达标（RMSE/内点比/点数门控失败）。
 - missing:\*：目标点缺失，当前帧无有效挠度。
-
-窗口显示已汉化：你会看到“状态: 缺失：几何质量不足...”这类中文提示；CSV 里仍保留英文状态码，便于后处理与统计。
 
 退出按键：q。
 
@@ -334,8 +345,24 @@ conda run --no-capture-output -n fai python yolo/run_deflection_realtime.py \
 `--overlay-level` 说明：
 
 - `minimal`：仅保留核心值，遮挡最少。
-- `balanced`：核心值 + 世界坐标。
-- `debug`：右侧调试面板，显示检测来源、置信度、几何质量、短历史曲线。
+- `balanced`：核心值 + 世界坐标（**不显示右侧灰色调试面板**）。
+- `debug`：显示右侧灰色调试面板，包含检测来源、置信度、几何质量、短历史曲线。
+- `start-mode`：`manual` 需按 `s` 开始基线，`auto` 启动即开始。
+- `measurement-method`：推荐 `target-pnp`。它使用 ID42 目标标记的 50mm 已知尺寸估计相机坐标位移，更适合跨中目标不在静态标定板同一平面的场景。
+
+重要算法说明：
+
+- `homography` 方法假设跨中目标与 5 个静态标记在同一平面；若目标贴在桥上、静态标记贴在后方背板上，两者不共面，真实 40mm 位移可能只被算成几 mm。
+- `target-pnp` 方法依赖相机去畸变标定和 ID42 目标标记边长（默认 50mm），当前版本推荐用于实测挠度。
+
+说明：OpenCV 默认 `cv2.putText` 字体在很多环境下不支持中文，窗口里可能显示 `????`。  
+因此当前版本将**窗口叠加文字**统一为英文短语（避免乱码），命令行提示与 README 保持中文说明。
+
+`manual` 模式下的基线提示：
+
+- 按 `s` 后会打印：`已锁定并开始基线标定。`
+- 当基线完成时会打印：`基线标定完成，可开始加载/施加载荷。`
+- 窗口内也会短暂显示：`Baseline done. You may load now.`
 
 ## 9. 离线复算标准流程
 

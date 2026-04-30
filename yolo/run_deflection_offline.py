@@ -40,36 +40,32 @@ def parseArgs() -> argparse.Namespace:
 
 def localizeStatus(status: str) -> str:
     if status == "calibrating-baseline":
-        return "基线标定中"
+        return "calibrating-baseline"
     if status.startswith("tracking:"):
         key = status.split(":", 1)[1]
         mapping = {
-            "yolo": "YOLO 跟踪",
-            "yolo-fallback-top1": "YOLO 最高置信框回退",
-            "fallback-aruco": "Aruco 回退",
-            "fallback-circle": "同心圆回退",
+            "yolo": "tracking-yolo",
+            "fallback-aruco": "tracking-aruco",
         }
-        return f"跟踪中：{mapping.get(key, key)}"
+        return mapping.get(key, key)
     if status.startswith("missing:"):
         key = status.split(":", 1)[1]
         mapping = {
-            "no-static-markers": "未检测到足够静态标记",
-            "low-homography-quality": "几何质量不足（重投影/内点比/点数未达标）",
-            "yolo-no-target": "YOLO 未检测到目标",
-            "fallback-no-target": "回退检测也未找到目标",
+            "no-static-markers": "missing-static-markers",
+            "low-homography-quality": "missing-low-homography-quality",
+            "yolo-no-target": "missing-yolo-target",
+            "fallback-no-target": "missing-fallback-target",
         }
-        return f"缺失：{mapping.get(key, key)}"
+        return mapping.get(key, key)
     return status
 
 
 def localizeDetectionSource(status: str) -> str:
     mapping = {
         "yolo": "YOLO",
-        "yolo-fallback-top1": "YOLO最高置信框",
-        "fallback-aruco": "Aruco回退",
-        "fallback-circle": "同心圆回退",
-        "yolo-no-target": "YOLO未检出",
-        "fallback-no-target": "回退未检出",
+        "fallback-aruco": "Aruco-fallback",
+        "yolo-no-target": "YOLO-none",
+        "fallback-no-target": "Fallback-none",
     }
     return mapping.get(status, status)
 
@@ -192,7 +188,7 @@ def main() -> int:
             )
             cv2.putText(
                 overlay,
-                f"状态: {localizeStatus(state.status)}",
+                f"Status: {localizeStatus(state.status)}",
                 (20, 95),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.7,
@@ -217,12 +213,12 @@ def main() -> int:
                 panel = np.zeros((overlay.shape[0], panelWidth, 3), dtype=np.uint8)
                 panel[:] = (24, 24, 24)
                 lines = [
-                    f"去畸变: {'开启' if calibration is not None else '关闭'}",
-                    f"有效点数: {homographyResult.usedPointCount}",
-                    f"重投影RMSE(px): {homographyResult.reprojectionRmsePx}",
-                    f"内点比例: {homographyResult.inlierRatio}",
-                    f"检测来源: {localizeDetectionSource(detection.status)}",
-                    f"检测置信度: {detection.confidence:.3f}",
+                    f"Undistort: {'ON' if calibration is not None else 'OFF'}",
+                    f"Used points: {homographyResult.usedPointCount}",
+                    f"Reproj RMSE(px): {homographyResult.reprojectionRmsePx}",
+                    f"Inlier ratio: {homographyResult.inlierRatio}",
+                    f"Detect src: {localizeDetectionSource(detection.status)}",
+                    f"Detect conf: {detection.confidence:.3f}",
                 ]
                 y = 30
                 for line in lines:

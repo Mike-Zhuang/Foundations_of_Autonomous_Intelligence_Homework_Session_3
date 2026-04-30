@@ -14,7 +14,7 @@ from bridge_ai.calibration import CameraCalibration, loadCalibration, runCharuco
 from bridge_ai.config import loadLayout
 from bridge_ai.deflection import DeflectionEstimator
 from bridge_ai.detection import MidpointTargetDetector
-from bridge_ai.geometry import ArucoStaticSolver, drawOverlay
+from bridge_ai.geometry import ArucoStaticSolver, drawOverlay, estimateMarkerPoseTvec
 from bridge_ai.io_utils import CsvWriter, createVideoWriter, openVideoSource
 
 
@@ -32,6 +32,9 @@ def parseArgs() -> argparse.Namespace:
     parser.add_argument("--calibration-mode", choices=["off", "use", "recalibrate"], default="use")
     parser.add_argument("--calibration-file", default="yolo/artifacts/camera_calibration.npz")
     parser.add_argument("--overlay-level", choices=["minimal", "balanced", "debug"], default="debug")
+    parser.add_argument("--start-mode", choices=["manual", "auto"], default="manual", help="manual: 按 s 才开始基线")
+    parser.add_argument("--measurement-method", choices=["target-pnp", "homography"], default="target-pnp")
+    parser.add_argument("--target-marker-size", type=float, default=50.0, help="ID42 目标标记边长，单位 mm")
     parser.add_argument("--min-used-points", type=int, default=16)
     parser.add_argument("--max-rmse", type=float, default=2.6)
     parser.add_argument("--min-inlier-ratio", type=float, default=0.65)
@@ -50,46 +53,47 @@ def printRealtimeGuide(args: argparse.Namespace) -> None:
     print(f"去畸变模式: {args.calibration_mode}", flush=True)
     print(f"标定文件: {args.calibration_file}", flush=True)
     print(f"显示模式: {args.overlay_level}", flush=True)
+    print(f"启动模式: {args.start_mode}", flush=True)
+    print(f"测量方法: {args.measurement_method}", flush=True)
     print("建议操作顺序:", flush=True)
     print("1) 若首次实验或机位变化，使用 --calibration-mode recalibrate", flush=True)
-    print("2) 基线阶段保持空载静止，等待状态从 calibrating-baseline 进入 tracking:*", flush=True)
-    print("3) 观察右侧调试面板中的 H RMSE / Inlier ratio / Detect src", flush=True)
-    print("4) 按 q 退出并保存 CSV", flush=True)
+    print("2) 调好机位后，按 s 开始基线（manual 模式）", flush=True)
+    print("3) 基线阶段保持空载静止，等待状态从 calibrating-baseline 进入 tracking:*", flush=True)
+    print("4) 观察右侧调试面板中的 H RMSE / Inlier ratio / Detect src", flush=True)
+    print("5) 按 q 退出并保存 CSV", flush=True)
     print("===============================================\n", flush=True)
 
 
 def localizeStatus(status: str) -> str:
+    if status == "waiting-start":
+        return "waiting-start"
     if status == "calibrating-baseline":
-        return "基线标定中"
+        return "calibrating-baseline"
     if status.startswith("tracking:"):
         key = status.split(":", 1)[1]
         mapping = {
-            "yolo": "YOLO 跟踪",
-            "yolo-fallback-top1": "YOLO 最高置信框回退",
-            "fallback-aruco": "Aruco 回退",
-            "fallback-circle": "同心圆回退",
+            "yolo": "tracking-yolo",
+            "fallback-aruco": "tracking-aruco",
         }
-        return f"跟踪中：{mapping.get(key, key)}"
+        return mapping.get(key, key)
     if status.startswith("missing:"):
         key = status.split(":", 1)[1]
         mapping = {
-            "no-static-markers": "未检测到足够静态标记",
-            "low-homography-quality": "几何质量不足（重投影/内点比/点数未达标）",
-            "yolo-no-target": "YOLO 未检测到目标",
-            "fallback-no-target": "回退检测也未找到目标",
+            "no-static-markers": "missing-static-markers",
+            "low-homography-quality": "missing-low-homography-quality",
+            "yolo-no-target": "missing-yolo-target",
+            "fallback-no-target": "missing-fallback-target",
         }
-        return f"缺失：{mapping.get(key, key)}"
+        return mapping.get(key, key)
     return status
 
 
 def localizeDetectionSource(status: str) -> str:
     mapping = {
         "yolo": "YOLO",
-        "yolo-fallback-top1": "YOLO最高置信框",
-        "fallback-aruco": "Aruco回退",
-        "fallback-circle": "同心圆回退",
-        "yolo-no-target": "YOLO未检出",
-        "fallback-no-target": "回退未检出",
+        "fallback-aruco": "Aruco-fallback",
+        "yolo-no-target": "YOLO-none",
+        "fallback-no-target": "Fallback-none",
     }
     return mapping.get(status, status)
 
@@ -170,7 +174,7 @@ def main() -> int:
         imageSize=args.imgsz,
         targetClassName=args.target_class,
     )
-    estimator = DeflectionEstimator(baselineFrames=args.baseline_frames)
+    estimator: DeflectionEstimator | None = None
 
     capture = openVideoSource(args.source, preferAvfoundation=True)
     calibration = resolveCalibration(args, capture)
@@ -201,8 +205,13 @@ def main() -> int:
     windowName = "Bridge Deflection Realtime"
     cv2.namedWindow(windowName, cv2.WINDOW_NORMAL)
 
-    startTime = time.time()
+    started = args.start_mode == "auto"
+    startTime = time.time() if started else None
     historyMm: deque[float] = deque(maxlen=180)
+    baselineReady = False
+    baselineDoneAt: float | None = None
+    if started:
+        estimator = DeflectionEstimator(baselineFrames=args.baseline_frames)
 
     try:
         frame = firstFrame
@@ -214,7 +223,6 @@ def main() -> int:
                     break
                 frame = undistortFrame(frameRaw, calibration) if calibration is not None else frameRaw
 
-            elapsed = time.time() - startTime
             homographyResult = solver.solveHomography(frame, layout)
             detection = detector.detect(frame)
 
@@ -228,24 +236,56 @@ def main() -> int:
             )
 
             worldPoint = None
+            poseTvec = None
+            measurementYmm = None
+            measurementMethod = "none"
             if homographyResult.homography is not None and detection.centerPixel is not None and not isLowQuality:
                 worldPoint = solver.pixelToWorld(homographyResult.homography, detection.centerPixel)
 
-            statusHint = detection.status
-            if homographyResult.homography is None:
-                statusHint = "no-static-markers"
-            elif isLowQuality:
-                statusHint = "low-homography-quality"
+            if (
+                args.measurement_method == "target-pnp"
+                and calibration is not None
+                and detection.markerCorners is not None
+            ):
+                poseTvec = estimateMarkerPoseTvec(
+                    markerCorners=detection.markerCorners,
+                    markerSizeMm=args.target_marker_size,
+                    cameraMatrix=calibration.cameraMatrix,
+                )
+                if poseTvec is not None:
+                    measurementYmm = poseTvec[1]
+                    measurementMethod = "target-pnp"
 
-            state = estimator.update(
-                worldYmm=(worldPoint[1] if worldPoint is not None else None),
-                timeSec=elapsed,
-                confidence=detection.confidence,
-                statusHint=statusHint,
-            )
-            csvWriter.write(state)
-            if state.filteredMm is not None:
-                historyMm.append(float(state.filteredMm))
+            if measurementYmm is None and worldPoint is not None:
+                measurementYmm = worldPoint[1]
+                measurementMethod = "homography"
+
+            state = None
+            statusCn = localizeStatus("waiting-start")
+            if started:
+                assert estimator is not None and startTime is not None
+                elapsed = time.time() - startTime
+                statusHint = detection.status
+                if measurementMethod == "homography":
+                    if homographyResult.homography is None:
+                        statusHint = "no-static-markers"
+                    elif isLowQuality:
+                        statusHint = "low-homography-quality"
+
+                state = estimator.update(
+                    worldYmm=measurementYmm,
+                    timeSec=elapsed,
+                    confidence=detection.confidence,
+                    statusHint=statusHint,
+                )
+                csvWriter.write(state)
+                if state.filteredMm is not None:
+                    historyMm.append(float(state.filteredMm))
+                statusCn = localizeStatus(state.status)
+                if state.baselineMm is not None and not baselineReady:
+                    baselineReady = True
+                    baselineDoneAt = time.time()
+                    print("基线标定完成，可开始加载/施加载荷。", flush=True)
 
             overlay = drawOverlay(frame, homographyResult, detection.centerPixel)
             if worldPoint is not None and args.overlay_level in ("balanced", "debug"):
@@ -262,7 +302,7 @@ def main() -> int:
 
             cv2.putText(
                 overlay,
-                f"Deflection(cm): {formatNumber(state.deflectionCm, 3)}",
+                f"Deflection(cm): {formatNumber(state.deflectionCm if state is not None else None, 3)}",
                 (20, 65),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.8,
@@ -272,7 +312,7 @@ def main() -> int:
             )
             cv2.putText(
                 overlay,
-                f"Baseline(mm): {formatNumber(state.baselineMm, 2)}",
+                f"Baseline(mm): {formatNumber(state.baselineMm if state is not None else None, 2)}",
                 (20, 95),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.7,
@@ -280,10 +320,9 @@ def main() -> int:
                 2,
                 cv2.LINE_AA,
             )
-            statusCn = localizeStatus(state.status)
             cv2.putText(
                 overlay,
-                f"状态: {statusCn}",
+                f"Status: {statusCn}",
                 (20, 125),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.6,
@@ -293,7 +332,7 @@ def main() -> int:
             )
             cv2.putText(
                 overlay,
-                "按 q 退出",
+                "Press q to quit",
                 (20, frame.shape[0] - 20),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.7,
@@ -301,18 +340,42 @@ def main() -> int:
                 2,
                 cv2.LINE_AA,
             )
+            if not started:
+                cv2.putText(
+                    overlay,
+                    "Press s to lock camera and start baseline",
+                    (20, 185),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (80, 220, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+            elif baselineDoneAt is not None and time.time() - baselineDoneAt <= 3.0:
+                cv2.putText(
+                    overlay,
+                    "Baseline done. You may load now.",
+                    (20, 185),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (80, 220, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
 
             if args.overlay_level == "debug":
                 lines = [
-                    f"去畸变: {'开启' if calibration is not None else '关闭'}",
-                    f"标定 RMS: {formatNumber(calibration.rms if calibration else None, 4)}",
-                    f"静态ID: {homographyResult.foundMarkerIds}",
-                    f"有效点数: {homographyResult.usedPointCount}",
-                    f"重投影RMSE(px): {formatNumber(homographyResult.reprojectionRmsePx, 3)}",
-                    f"内点比例: {formatNumber(homographyResult.inlierRatio, 3)}",
-                    f"检测来源: {localizeDetectionSource(detection.status)}",
-                    f"检测置信度: {detection.confidence:.3f}",
-                    f"目标像素: {detection.centerPixel}",
+                    f"Undistort: {'ON' if calibration is not None else 'OFF'}",
+                    f"Calib RMS: {formatNumber(calibration.rms if calibration else None, 4)}",
+                    f"Static IDs: {homographyResult.foundMarkerIds}",
+                    f"Used points: {homographyResult.usedPointCount}",
+                    f"Reproj RMSE(px): {formatNumber(homographyResult.reprojectionRmsePx, 3)}",
+                    f"Inlier ratio: {formatNumber(homographyResult.inlierRatio, 3)}",
+                    f"Detect src: {localizeDetectionSource(detection.status)}",
+                    f"Detect conf: {detection.confidence:.3f}",
+                    f"Measure: {measurementMethod}",
+                    f"Target pixel: {detection.centerPixel}",
+                    f"Target tvec(mm): {poseTvec}",
                 ]
                 renderFrame = attachDebugPanel(overlay, lines, list(historyMm))
             else:
@@ -325,6 +388,14 @@ def main() -> int:
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
                 break
+            if key == ord("s") and not started:
+                started = True
+                estimator = DeflectionEstimator(baselineFrames=args.baseline_frames)
+                startTime = time.time()
+                historyMm.clear()
+                baselineReady = False
+                baselineDoneAt = None
+                print("已锁定并开始基线标定。", flush=True)
             frame = None
     finally:
         csvWriter.close()
