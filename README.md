@@ -12,9 +12,10 @@
 
 ### 1.2 本实现的测量边界（必须理解）
 
-- 该实现使用平面单应矩阵（Homography）做像素到毫米映射。
-- 因此，静态标定板与跨中标记应尽量处于同一观测平面。
-- 若跨中标记明显偏离该平面（前后景深差大），会引入系统误差。
+- 当前推荐方法是 `target-local-scale`。
+- ID42 目标标记负责主测量：程序用它真实的 50mm 边长估计目标点附近的局部像素/mm。
+- 5 个静态 ArUco 标记负责提供不动参考方向和相机晃动补偿，不再把跨中目标强行投到静态板平面上。
+- ChArUco 只用于相机内参与畸变标定；若使用 `target-local-scale`，它不是绝对必要，但仍建议保留以减少边缘畸变。
 
 ## 2. 代码结构与职责
 
@@ -111,7 +112,7 @@ conda run --no-capture-output -n fai python ...
 | 11  |         (162, 8) |   40 |      (182, 28) |
 | 12  |       (162, 249) |   40 |     (182, 269) |
 | 13  |         (8, 249) |   40 |      (28, 269) |
-| 14  |       (85, 128)  |   40 |     (105, 148) |
+| 14  |        (85, 128) |   40 |     (105, 148) |
 
 说明：
 
@@ -284,7 +285,12 @@ conda run --no-capture-output -n fai python yolo/run_deflection_realtime.py \
   --imgsz 640 \
   --baseline-frames 60 \
   --start-mode manual \
-  --measurement-method static-compensated-pnp \
+  --filter-profile stable \
+  --deadband-mm 0.2 \
+  --smooth-window 9 \
+  --local-scale-mode baseline \
+  --deflection-scale 1.0 \
+  --measurement-method target-local-scale \
   --calibration-mode use \
   --calibration-file yolo/artifacts/camera_calibration.npz \
   --overlay-level debug
@@ -296,7 +302,12 @@ conda run --no-capture-output -n fai python yolo/run_deflection_realtime.py \
 conda run --no-capture-output -n fai python yolo/run_deflection_realtime.py \
   --source 0 \
   --start-mode manual \
-  --measurement-method static-compensated-pnp \
+  --filter-profile stable \
+  --deadband-mm 0.2 \
+  --smooth-window 9 \
+  --local-scale-mode baseline \
+  --deflection-scale 1.0 \
+  --measurement-method target-local-scale \
   --calibration-mode recalibrate \
   --overlay-level debug
 ```
@@ -307,10 +318,15 @@ conda run --no-capture-output -n fai python yolo/run_deflection_realtime.py \
 conda run --no-capture-output -n fai python yolo/run_deflection_realtime.py \
   --source 0 \
   --start-mode manual \
-  --measurement-method static-compensated-pnp \
+  --filter-profile stable \
+  --deadband-mm 0.2 \
+  --smooth-window 9 \
+  --local-scale-mode baseline \
+  --deflection-scale 1.0 \
+  --measurement-method target-local-scale \
   --calibration-mode use \
   --calibration-file yolo/artifacts/camera_calibration.npz \
-  --overlay-level balanced
+  --overlay-level debug
 ```
 
 ## 8.2 基线阶段（非常关键）
@@ -348,13 +364,34 @@ conda run --no-capture-output -n fai python yolo/run_deflection_realtime.py \
 - `balanced`：核心值 + 世界坐标（**不显示右侧灰色调试面板**）。
 - `debug`：显示右侧灰色调试面板，包含检测来源、置信度、几何质量、短历史曲线。
 - `start-mode`：`manual` 需按 `s` 开始基线，`auto` 启动即开始。
-- `measurement-method`：推荐 `static-compensated-pnp`。它用 ID42 的 50mm 已知尺寸估计目标位置，再用 5 个静态点估计相机相对静态背景的姿态，从而补偿轻微相机运动。
+- `filter-profile`：推荐 `stable`，静止读数更稳；`normal/fast` 响应更快但波动更明显。
+- `deadband-mm`：静止死区阈值，默认 `0.2mm`。小于该幅度的短时抖动会被保持为上一稳定值。
+- `smooth-window`：平滑窗口帧数，默认 `9`。数值越大越稳，但响应越慢。
+- `local-scale-mode`：推荐 `baseline`。基线阶段锁定 ID42 的局部比例尺，后续只测相对像素位移，避免桥受力后 ID42 轻微转动导致比例尺漂移。
+- `deflection-scale`：赛前固定比例修正系数，默认 `1.0`。比赛现场不要用真值临时调整它。
+- `measurement-method`：推荐 `target-local-scale`。它在基线阶段记录 ID42 中心投影位置，tracking 阶段只把“当前中心 - 基线中心”的像素差换算成毫米；ID42 的 50mm 真实边长用于计算目标附近局部比例，5 个静态点提供参考方向。
 
 重要算法说明：
 
 - `homography` 方法假设跨中目标与 5 个静态标记在同一平面；若目标贴在桥上、静态标记贴在后方背板上，两者不共面，真实 40mm 位移可能只被算成几 mm。
-- `target-pnp` 方法只使用 ID42 与相机内参，适合相机完全固定的情况。
-- `static-compensated-pnp` 是当前推荐方法：ID42 负责主测量，5 个 40mm 静态点负责估计相机/背景参考姿态，帮助抵消轻微相机晃动。
+- `target-local-scale` 方法不需要比赛现场已知位移；它只依赖赛前已经确认准确的 ID42=50mm 和静态点=40mm。
+- 该方法不会把局部比例尺作用到整张画面的绝对坐标上，因此比上一版更不容易出现 `5.0cm -> 5.3cm` 这种固定倍率偏差。
+- 默认 `local-scale-mode=baseline` 会使用基线阶段的 ID42 比例尺；如果你确认 ID42 只平移、不转动，这通常比使用当前帧比例尺更稳。
+- `target-pnp` 方法只使用 ID42 与相机内参，适合相机完全固定且 ChArUco 标定非常可靠的情况。
+- `static-compensated-pnp` 会使用相机内参、ID42 和 5 个静态点做 3D 位姿解算；若 ChArUco 标定或相机焦距状态变化，它可能出现稳定比例误差。
+
+固定比例误差判断：
+
+- 如果 ID42 不动时只是小幅跳动，这是滤波/角点稳定性问题。
+- 如果尺子真值 `-5.0cm` 稳定显示约 `-5.3~-5.4cm`，真值 `-10.0cm` 稳定显示约 `-10.85cm`，这不是滤波问题，而是尺度倍率问题。
+- 比赛不能用现场真值校正；若要使用 `--deflection-scale`，只能在赛前用同一相机、同一机位策略、同一套打印件固定确定一次，然后比赛时保持不变。
+- 现在优先尝试 `--measurement-method target-local-scale`，因为它直接使用 ID42 自身的 50mm 边长做局部尺度，理论上比纯 PnP 更不容易受相机内参倍率影响。
+
+方块边缘是否要和手机画面平行：
+
+- 不需要严格平行，ArUco 可以有旋转。
+- 但不要过度倾斜、不要反光、不要太靠画面边缘。
+- ID42 最好尽量正对相机，并且加载前后不要发生明显扭转；如果桥面弯曲导致标记自己大幅转角，任意视觉方法都会变差。
 
 说明：OpenCV 默认 `cv2.putText` 字体在很多环境下不支持中文，窗口里可能显示 `????`。  
 因此当前版本将**窗口叠加文字**统一为英文短语（避免乱码），命令行提示与 README 保持中文说明。
@@ -398,12 +435,20 @@ conda run --no-capture-output -n fai python yolo/run_deflection_offline.py \
 CSV 字段固定为：
 
 - timeSec：时间戳（秒）。
-- rawMm：基线差原始值（mm）。
-- filteredMm：卡尔曼滤波后（mm）。
+- rawMm：经过 `deflection-scale` 修正后的基线差原始值（mm）。
+- unscaledRawMm：未经过 `deflection-scale` 修正的原始几何基线差（mm）。
+- filteredMm：滤波 + 短窗口平滑 + 静止死区后的显示值（mm）。
 - baselineMm：基线 worldY（mm）。
 - deflectionCm：filteredMm / 10（cm）。
 - confidence：检测置信度。
 - status：状态字符串。
+
+滤波说明：
+
+- `rawMm` 用于追溯修正后的真实输入，不受死区冻结影响。
+- `unscaledRawMm` 用于排查尺度倍率问题。
+- `filteredMm` 用于实时显示和 `deflectionCm`，默认偏稳。
+- 如果想看响应更快，可把 `--filter-profile stable` 改成 `normal` 或 `fast`。
 
 ## 11. 砝码重量数据采集与模型训练
 

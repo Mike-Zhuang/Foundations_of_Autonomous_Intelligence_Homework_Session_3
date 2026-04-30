@@ -34,11 +34,14 @@ class CsvWriter:
             fieldnames=[
                 "timeSec",
                 "rawMm",
+                "unscaledRawMm",
                 "filteredMm",
                 "baselineMm",
                 "deflectionCm",
                 "confidence",
                 "status",
+                "measurementPositionPx",
+                "measurementPxPerMm",
             ],
         )
         self.writer.writeheader()

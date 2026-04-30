@@ -41,6 +41,12 @@ def parseArgs() -> argparse.Namespace:
     parser.add_argument("--max-rmse", type=float, default=2.6)
     parser.add_argument("--min-inlier-ratio", type=float, default=0.65)
     parser.add_argument("--min-used-points", type=int, default=16)
+    parser.add_argument(
+        "--deflection-scale",
+        type=float,
+        default=1.0,
+        help="现场比例修正系数。例：尺子 100mm、显示 108.5mm，则填 100/108.5=0.922",
+    )
     parser.add_argument("--output-dir", default="yolo/results/weight_model")
     return parser.parse_args()
 
@@ -361,7 +367,7 @@ def main() -> int:
         imageSize=args.imgsz,
         targetClassName=args.target_class,
     )
-    estimator = DeflectionEstimator(baselineFrames=args.baseline_frames)
+    estimator = DeflectionEstimator(baselineFrames=args.baseline_frames, deflectionScale=args.deflection_scale)
     capture = openVideoSource(args.source, preferAvfoundation=True)
     calibration = resolveCalibration(args, capture)
 

@@ -12,7 +12,7 @@ import numpy as np
 
 from bridge_ai.calibration import CameraCalibration, loadCalibration, runCharucoCalibration, saveCalibration, undistortFrame
 from bridge_ai.config import loadLayout
-from bridge_ai.deflection import DeflectionEstimator
+from bridge_ai.deflection import DeflectionEstimator, PixelScaleDeflectionEstimator
 from bridge_ai.detection import MidpointTargetDetector
 from bridge_ai.geometry import (
     ArucoStaticSolver,
@@ -20,6 +20,8 @@ from bridge_ai.geometry import (
     drawOverlay,
     estimateMarkerPoseTvec,
     estimateStaticBoardPose,
+    estimateStaticPixelAxis,
+    estimateTargetLocalCoordinateY,
 )
 from bridge_ai.io_utils import CsvWriter, createVideoWriter, openVideoSource
 
@@ -39,10 +41,25 @@ def parseArgs() -> argparse.Namespace:
     parser.add_argument("--calibration-file", default="yolo/artifacts/camera_calibration.npz")
     parser.add_argument("--overlay-level", choices=["minimal", "balanced", "debug"], default="debug")
     parser.add_argument("--start-mode", choices=["manual", "auto"], default="manual", help="manual: 按 s 才开始基线")
+    parser.add_argument("--filter-profile", choices=["stable", "normal", "fast"], default="stable")
+    parser.add_argument("--deadband-mm", type=float, default=0.2)
+    parser.add_argument("--smooth-window", type=int, default=9)
+    parser.add_argument(
+        "--local-scale-mode",
+        choices=["baseline", "current", "average"],
+        default="baseline",
+        help="target-local-scale 的比例尺来源。baseline 最稳，current 响应当前透视，average 折中",
+    )
+    parser.add_argument(
+        "--deflection-scale",
+        type=float,
+        default=1.0,
+        help="赛前固定比例修正系数。例：赛前验证真值 100mm、显示 108.5mm，则填 100/108.5=0.922",
+    )
     parser.add_argument(
         "--measurement-method",
-        choices=["static-compensated-pnp", "target-pnp", "homography"],
-        default="static-compensated-pnp",
+        choices=["target-local-scale", "static-compensated-pnp", "target-pnp", "homography"],
+        default="target-local-scale",
     )
     parser.add_argument("--target-marker-size", type=float, default=50.0, help="ID42 目标标记边长，单位 mm")
     parser.add_argument("--min-used-points", type=int, default=16)
@@ -65,6 +82,9 @@ def printRealtimeGuide(args: argparse.Namespace) -> None:
     print(f"显示模式: {args.overlay_level}", flush=True)
     print(f"启动模式: {args.start_mode}", flush=True)
     print(f"测量方法: {args.measurement_method}", flush=True)
+    print(f"滤波档位: {args.filter_profile} (deadband={args.deadband_mm}mm, window={args.smooth_window})", flush=True)
+    print(f"局部比例尺模式: {args.local_scale_mode}", flush=True)
+    print(f"挠度比例修正: {args.deflection_scale}", flush=True)
     print("建议操作顺序:", flush=True)
     print("1) 若首次实验或机位变化，使用 --calibration-mode recalibrate", flush=True)
     print("2) 调好机位后，按 s 开始基线（manual 模式）", flush=True)
@@ -184,7 +204,7 @@ def main() -> int:
         imageSize=args.imgsz,
         targetClassName=args.target_class,
     )
-    estimator: DeflectionEstimator | None = None
+    estimator: DeflectionEstimator | PixelScaleDeflectionEstimator | None = None
 
     capture = openVideoSource(args.source, preferAvfoundation=True)
     calibration = resolveCalibration(args, capture)
@@ -221,7 +241,15 @@ def main() -> int:
     baselineReady = False
     baselineDoneAt: float | None = None
     if started:
-        estimator = DeflectionEstimator(baselineFrames=args.baseline_frames)
+        estimatorClass = PixelScaleDeflectionEstimator if args.measurement_method == "target-local-scale" else DeflectionEstimator
+        estimator = estimatorClass(
+            baselineFrames=args.baseline_frames,
+            filterProfile=args.filter_profile,
+            deadbandMm=args.deadband_mm,
+            smoothWindow=args.smooth_window,
+            deflectionScale=args.deflection_scale,
+            localScaleMode=args.local_scale_mode,
+        )
 
     try:
         frame = firstFrame
@@ -249,6 +277,8 @@ def main() -> int:
             poseTvec = None
             staticBoardPose = None
             compensatedWorldPoint = None
+            targetPositionPx = None
+            targetPxPerMm = None
             measurementYmm = None
             measurementMethod = "none"
             if homographyResult.homography is not None and detection.centerPixel is not None and not isLowQuality:
@@ -256,6 +286,25 @@ def main() -> int:
 
             if calibration is not None and homographyResult.usedPointCount >= args.min_used_points and not isLowQuality:
                 staticBoardPose = estimateStaticBoardPose(homographyResult, calibration.cameraMatrix)
+
+            if (
+                args.measurement_method == "target-local-scale"
+                and homographyResult.homography is not None
+                and detection.markerCorners is not None
+                and not isLowQuality
+            ):
+                staticPixelAxis = estimateStaticPixelAxis(homographyResult.homography)
+                if staticPixelAxis is not None:
+                    originPixel, axisUnit = staticPixelAxis
+                    localScaleResult = estimateTargetLocalCoordinateY(
+                        markerCorners=detection.markerCorners,
+                        markerSizeMm=args.target_marker_size,
+                        originPixel=originPixel,
+                        axisUnit=axisUnit,
+                    )
+                    if localScaleResult is not None:
+                        targetPositionPx, targetPxPerMm = localScaleResult
+                        measurementMethod = "target-local-scale"
 
             if (
                 args.measurement_method in ("static-compensated-pnp", "target-pnp")
@@ -286,18 +335,27 @@ def main() -> int:
                 assert estimator is not None and startTime is not None
                 elapsed = time.time() - startTime
                 statusHint = detection.status
-                if measurementMethod == "homography":
+                if args.measurement_method in ("target-local-scale", "homography"):
                     if homographyResult.homography is None:
                         statusHint = "no-static-markers"
                     elif isLowQuality:
                         statusHint = "low-homography-quality"
 
-                state = estimator.update(
-                    worldYmm=measurementYmm,
-                    timeSec=elapsed,
-                    confidence=detection.confidence,
-                    statusHint=statusHint,
-                )
+                if isinstance(estimator, PixelScaleDeflectionEstimator) and args.measurement_method == "target-local-scale":
+                    state = estimator.updatePixelScale(
+                        positionPx=targetPositionPx,
+                        pxPerMm=targetPxPerMm,
+                        timeSec=elapsed,
+                        confidence=detection.confidence,
+                        statusHint=statusHint,
+                    )
+                else:
+                    state = estimator.update(
+                        worldYmm=measurementYmm,
+                        timeSec=elapsed,
+                        confidence=detection.confidence,
+                        statusHint=statusHint,
+                    )
                 csvWriter.write(state)
                 if state.filteredMm is not None:
                     historyMm.append(float(state.filteredMm))
@@ -394,9 +452,20 @@ def main() -> int:
                     f"Detect src: {localizeDetectionSource(detection.status)}",
                     f"Detect conf: {detection.confidence:.3f}",
                     f"Measure: {measurementMethod}",
+                    f"Filter: {args.filter_profile}",
+                    f"Deadband(mm): {args.deadband_mm:.3f}",
+                    f"Scale mode: {args.local_scale_mode}",
+                    f"Scale: {args.deflection_scale:.5f}",
+                    f"Raw(mm): {formatNumber(state.rawMm if state is not None else None, 3)}",
+                    f"Raw0(mm): {formatNumber(state.unscaledRawMm if state is not None else None, 3)}",
+                    f"Filtered(mm): {formatNumber(state.filteredMm if state is not None else None, 3)}",
                     f"Target pixel: {detection.centerPixel}",
                     f"Target tvec(mm): {poseTvec}",
                     f"Target world(mm): {compensatedWorldPoint}",
+                    f"Target pos(px): {formatNumber(targetPositionPx, 3)}",
+                    f"Target px/mm: {formatNumber(targetPxPerMm, 3)}",
+                    f"State pos(px): {formatNumber(state.measurementPositionPx if state is not None else None, 3)}",
+                    f"State px/mm: {formatNumber(state.measurementPxPerMm if state is not None else None, 3)}",
                 ]
                 renderFrame = attachDebugPanel(overlay, lines, list(historyMm))
             else:
@@ -411,7 +480,15 @@ def main() -> int:
                 break
             if key == ord("s") and not started:
                 started = True
-                estimator = DeflectionEstimator(baselineFrames=args.baseline_frames)
+                estimatorClass = PixelScaleDeflectionEstimator if args.measurement_method == "target-local-scale" else DeflectionEstimator
+                estimator = estimatorClass(
+                    baselineFrames=args.baseline_frames,
+                    filterProfile=args.filter_profile,
+                    deadbandMm=args.deadband_mm,
+                    smoothWindow=args.smooth_window,
+                    deflectionScale=args.deflection_scale,
+                    localScaleMode=args.local_scale_mode,
+                )
                 startTime = time.time()
                 historyMm.clear()
                 baselineReady = False

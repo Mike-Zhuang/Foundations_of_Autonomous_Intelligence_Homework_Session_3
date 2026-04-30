@@ -201,3 +201,82 @@ def cameraPointToStaticWorld(
     worldPoint = rotation.T @ (cameraPoint - tvec.reshape(3, 1))
     xWorld, yWorld, zWorld = worldPoint.reshape(3).tolist()
     return float(xWorld), float(yWorld), float(zWorld)
+
+
+def estimateStaticPixelAxis(
+    homography: np.ndarray,
+    originWorldMm: Tuple[float, float] = (105.0, 148.0),
+    yStepMm: float = 40.0,
+) -> Optional[Tuple[Tuple[float, float], Tuple[float, float]]]:
+    try:
+        inverseHomography = np.linalg.inv(homography)
+    except np.linalg.LinAlgError:
+        return None
+
+    worldPoints = np.asarray(
+        [
+            [[originWorldMm[0], originWorldMm[1]]],
+            [[originWorldMm[0], originWorldMm[1] + yStepMm]],
+        ],
+        dtype=np.float32,
+    )
+    pixelPoints = cv2.perspectiveTransform(worldPoints, inverseHomography).reshape(2, 2)
+    originPixel = pixelPoints[0]
+    yPixel = pixelPoints[1]
+    axis = yPixel - originPixel
+    axisNorm = float(np.linalg.norm(axis))
+    if axisNorm < 1e-6:
+        return None
+
+    axisUnit = axis / axisNorm
+    return (
+        (float(originPixel[0]), float(originPixel[1])),
+        (float(axisUnit[0]), float(axisUnit[1])),
+    )
+
+
+def estimateTargetLocalCoordinateY(
+    markerCorners: np.ndarray,
+    markerSizeMm: float,
+    originPixel: Tuple[float, float],
+    axisUnit: Tuple[float, float],
+) -> Optional[Tuple[float, float]]:
+    points = np.asarray(markerCorners, dtype=np.float32).reshape(4, 2)
+    centerPixel = points.mean(axis=0)
+    origin = np.asarray(originPixel, dtype=np.float32)
+    axis = np.asarray(axisUnit, dtype=np.float32)
+    axisNorm = float(np.linalg.norm(axis))
+    if axisNorm < 1e-6:
+        return None
+    axis = axis / axisNorm
+
+    # 用 ID42 四角建立“图像像素 -> 标记真实毫米坐标”的局部透视映射。
+    # 然后沿静态 Y 方向做有限差分，得到目标中心附近该方向的真实局部比例尺。
+    # 这样比直接取某条边的像素长度更稳，能处理 ID42 有旋转或轻微透视的情况。
+    halfSize = markerSizeMm * 0.5
+    markerWorld = np.asarray(
+        [
+            [-halfSize, -halfSize],
+            [halfSize, -halfSize],
+            [halfSize, halfSize],
+            [-halfSize, halfSize],
+        ],
+        dtype=np.float32,
+    )
+    imageToMarker = cv2.getPerspectiveTransform(points.astype(np.float32), markerWorld)
+    stepPx = 10.0
+    probePixels = np.asarray(
+        [
+            [[float(centerPixel[0]), float(centerPixel[1])]],
+            [[float(centerPixel[0] + axis[0] * stepPx), float(centerPixel[1] + axis[1] * stepPx)]],
+        ],
+        dtype=np.float32,
+    )
+    probeMarker = cv2.perspectiveTransform(probePixels, imageToMarker).reshape(2, 2)
+    mmPerStep = float(np.linalg.norm(probeMarker[1] - probeMarker[0]))
+    if mmPerStep < 1e-6:
+        return None
+
+    pxPerMm = stepPx / mmPerStep
+    positionPx = float(np.dot(centerPixel - origin, axis))
+    return positionPx, pxPerMm

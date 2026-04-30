@@ -35,6 +35,12 @@ def parseArgs() -> argparse.Namespace:
     parser.add_argument("--min-used-points", type=int, default=16)
     parser.add_argument("--max-rmse", type=float, default=2.6)
     parser.add_argument("--min-inlier-ratio", type=float, default=0.65)
+    parser.add_argument(
+        "--deflection-scale",
+        type=float,
+        default=1.0,
+        help="赛前固定比例修正系数。例：赛前验证真值 100mm、显示 108.5mm，则填 100/108.5=0.922",
+    )
     return parser.parse_args()
 
 
@@ -103,7 +109,7 @@ def main() -> int:
         imageSize=args.imgsz,
         targetClassName=args.target_class,
     )
-    estimator = DeflectionEstimator(baselineFrames=args.baseline_frames)
+    estimator = DeflectionEstimator(baselineFrames=args.baseline_frames, deflectionScale=args.deflection_scale)
 
     calibration = None
     if args.calibration_mode == "use":
@@ -219,6 +225,10 @@ def main() -> int:
                     f"Inlier ratio: {homographyResult.inlierRatio}",
                     f"Detect src: {localizeDetectionSource(detection.status)}",
                     f"Detect conf: {detection.confidence:.3f}",
+                    f"Scale: {args.deflection_scale:.5f}",
+                    f"Raw(mm): {state.rawMm}",
+                    f"Raw0(mm): {state.unscaledRawMm}",
+                    f"Filtered(mm): {state.filteredMm}",
                 ]
                 y = 30
                 for line in lines:
