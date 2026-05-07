@@ -355,6 +355,17 @@ def parseWeightInput(text: str) -> Optional[float]:
 
 
 def main() -> int:
+    print(
+        "\n这个入口已经不再作为砝码重量训练主流程使用。\n"
+        "现在请使用三段式脚本：\n"
+        "1) 采集数据: python yolo/collect_weight_data.py\n"
+        "2) 训练模型: python yolo/train_weight_model.py --windows-csv <weight_windows.csv>\n"
+        "3) 实时预测: python yolo/predict_weight_realtime.py --model-path <best_weight_model.pth>\n"
+        "这样做是为了避免采集、训练、预测混在一起，导致实验数据无法复用。\n",
+        flush=True,
+    )
+    return 0
+
     args = parseArgs()
     printCollectorGuide(args)
     layoutPath = Path(args.layout)

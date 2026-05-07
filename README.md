@@ -23,7 +23,10 @@
 - yolo/generate_marker_board.py：生成静态标定板和跨中标记图。
 - yolo/run_deflection_realtime.py：实时测量入口。
 - yolo/run_deflection_offline.py：离线复算入口。
-- yolo/train_midpoint_yolo.py：砝码重量数据采集 + 双任务模型（回归+分类）训练入口。
+- yolo/collect_weight_data.py：砝码重量数据采集入口。
+- yolo/train_weight_model.py：砝码重量模型训练入口。
+- yolo/predict_weight_realtime.py：实时重量预测入口。
+- yolo/train_midpoint_yolo.py：旧兼容入口，仅提示迁移到三段式流程。
 - yolo/bridge_ai/config.py：静态标记布局定义与读写。
 - yolo/bridge_ai/geometry.py：ArUco 检测 + 单应矩阵解算。
 - yolo/bridge_ai/detection.py：跨中目标检测（YOLO 主路径 + ArUco ID42 回退）。
@@ -450,53 +453,125 @@ CSV 字段固定为：
 - `filteredMm` 用于实时显示和 `deflectionCm`，默认偏稳。
 - 如果想看响应更快，可把 `--filter-profile stable` 改成 `normal` 或 `fast`。
 
-## 11. 砝码重量数据采集与模型训练
+## 11. 砝码重量数据采集、训练、预测
 
-`yolo/train_midpoint_yolo.py` 已重构为“采集 + 训练”一体化入口，不再用于 YOLO 检测模型训练。
+重量工作流已经拆成三段：**采集数据**、**训练模型**、**实时预测**。  
+旧入口 `yolo/train_midpoint_yolo.py` 只保留迁移提示，不再作为主流程使用。
 
-## 11.1 采集流程（交互式）
+三段脚本都复用当前挠度检测主算法：`target-local-scale + local-scale-mode baseline`。  
+这样不会影响第 8 节的实时挠度检测，也不会再走旧的 homography 采集逻辑。
 
-1. 启动脚本后，先按 `--calibration-mode` 执行去畸变流程（复用或重标定）。
-2. 命令行输入当前砝码重量（单位 g）。
-3. 在视频窗口按 `s` 开始采集，按 `e` 提前结束，或达到 `--min-valid-frames` 自动结束。
-4. 更换砝码后继续输入下一重量；输入 `done` 结束全部采集。
+## 11.1 第一步：采集重量数据
 
-避免混乱的小建议：
-
-- 每个重量建议采集 2~3 轮；
-- 每轮开始前等画面状态稳定到 `tracking:*` 再按 `s`；
-- 若出现 `missing:low-homography-quality`，先调整机位/光照再重采，不要硬采。
-
-## 11.2 训练命令（自动采集 + 自动训练）
+启动命令：
 
 ```bash
-conda run --no-capture-output -n fai python yolo/train_midpoint_yolo.py \
+conda run --no-capture-output -n fai python yolo/collect_weight_data.py \
   --source 0 \
-  --layout yolo/artifacts/static_marker_layout.json \
-  --model yolov8n.pt \
+  --measurement-method target-local-scale \
+  --local-scale-mode baseline \
+  --target-marker-size 50.0 \
   --calibration-mode use \
   --calibration-file yolo/artifacts/camera_calibration.npz \
-  --min-valid-frames 120 \
   --capture-seconds 8 \
-  --auto-train true \
-  --epochs 220 \
-  --batch-size 16 \
+  --min-valid-frames 120 \
+  --overlay-level debug
+```
+
+操作顺序：
+
+1. 启动后先保持**空载**，在视频窗口按 `s` 锁定基线。
+2. 基线完成后，命令行会提示输入重量，单位是 g，例如 `200`。
+3. 放稳当前砝码或小车后，在视频窗口按 `s` 开始采集。
+4. 采集达到 `--capture-seconds` 或 `--min-valid-frames` 后自动结束；也可以按 `e` 提前结束。
+5. 换下一个重量，继续在命令行输入重量。
+6. 所有重量采完后，命令行输入 `done` 保存数据并退出。
+
+窗口按键：
+
+- `s`：开始当前阶段。基线阶段表示开始空载基线；采集阶段表示开始采集当前重量。
+- `e`：提前结束当前重量采集。
+- `q`：中止整个采集流程。
+
+采集输出：
+
+- `yolo/results/weight_raw_<时间>.csv`：逐帧挠度、检测状态、质量指标。
+- `yolo/results/weight_windows_<时间>.csv`：每轮重量窗口的聚合特征，用于训练。
+- `yolo/results/weight_dataset_<时间>.metadata.json`：采集参数、重量档位、文件路径。
+
+建议：
+
+- 每个重量至少采 2 轮；机会少时优先保证每轮稳定，不要追求太多重量档。
+- 每轮采集前等 `Deflection(mm)` 稳定再按 `s`。
+- 若 debug 面板里 `Detect`、`Used points`、`RMSE` 明显异常，本轮不要采。
+
+## 11.2 第二步：训练重量模型
+
+训练命令：
+
+```bash
+conda run --no-capture-output -n fai python yolo/train_weight_model.py \
+  --windows-csv yolo/results/weight_windows_<时间>.csv \
+  --output-dir yolo/results/weight_model_<时间> \
+  --epochs 500 \
   --lr 1e-3
 ```
 
-仅采集不训练（后续手动训练）：
+训练逻辑：
+
+- 默认同时训练两类模型：稳健拟合模型和小 MLP。
+- 稳健拟合包含线性、二次、岭回归，用留一验证选择。
+- 小 MLP 结构为 `input -> 16 -> 8 -> 回归头/分类头`。
+- 最终按留一验证 MAE/RMSE 自动选择最佳模型。
+- 输出同时包含连续重量预测和最接近训练档位。
+
+训练输出：
+
+- `best_weight_model.pth`：预测脚本默认加载的模型文件。
+- `best_weight_model.json`：模型摘要，便于查看。
+- `metrics.json`：MAE、RMSE、R2、逐样本误差。
+- `feature_config.json`：训练使用的特征列表。
+- `label_map.json`：重量档位映射。
+
+命令行会打印每个样本的留一验证误差。若某个样本误差特别大，优先回看对应采集轮次。
+
+## 11.3 第三步：实时预测重量
+
+预测命令：
 
 ```bash
-conda run --no-capture-output -n fai python yolo/train_midpoint_yolo.py --auto-train false
+conda run --no-capture-output -n fai python yolo/predict_weight_realtime.py \
+  --source 0 \
+  --model-path yolo/results/weight_model_<时间>/best_weight_model.pth \
+  --measurement-method target-local-scale \
+  --local-scale-mode baseline \
+  --calibration-mode use \
+  --calibration-file yolo/artifacts/camera_calibration.npz \
+  --overlay-level debug
 ```
 
-## 11.3 特征与模型
+操作顺序：
 
-- 采集输出：`weight_dataset_*.csv` + `*.metadata.json`
-- 特征：挠度统计量（mean/std/p05/p50/p95 等）+ 质量指标（confidence/rmse/inlier/usedPoints）+ 稳定性指标
-- 模型：前馈全连接双任务网络（共享 backbone，回归头 + 分类头）
-- 损失：`0.7 * Huber + 0.3 * CrossEntropy`
-- 输出：`best.pth`、`label_map.json`、`metrics.json`
+1. 启动后先保持空载，在视频窗口按 `s` 锁定基线。
+2. 放上未知重量，等待挠度读数稳定。
+3. 窗口会连续显示实时重量估计，你可以观察稳定值。
+4. 想要最终输出时按 `s`，程序会采集一个稳定窗口并在命令行输出最终重量。
+5. 按 `q` 退出。
+
+预测输出：
+
+- `Live weight(g)`：滚动窗口实时估计。
+- `Nearest(g)`：最接近训练过的重量档位。
+- `FINAL`：按 `s` 后稳定窗口的最终预测。
+- debug 面板会显示挠度标准差、漂移等稳定性信息。
+
+## 11.4 比赛推荐流程
+
+1. 先用第 8 节确认挠度检测稳定、误差可接受。
+2. 空载启动 `collect_weight_data.py`，按 `s` 锁定基线。
+3. 按重量档逐轮采集，保存 `weight_raw` 和 `weight_windows`。
+4. 用 `train_weight_model.py` 训练，检查 `metrics.json` 中留一验证误差。
+5. 比赛预测时使用 `predict_weight_realtime.py`，仍然先空载按 `s` 锁定基线，再放未知重量。
 
 ## 12. 精度验收流程（建议按此提交实验结果）
 
@@ -560,8 +635,9 @@ conda run --no-capture-output -n fai python yolo/train_midpoint_yolo.py --auto-t
 1. 生成并打印标记（含 ChArUco 板）。
 2. 相机固定好后，先跑一次 `recalibrate`。
 3. 再跑实时脚本观察状态和调试面板，确认识别稳定。
-4. 进入采集训练脚本，按“输入重量 -> 按 s 采集 -> done 结束”循环。
-5. 若 `--auto-train true`，程序自动训练并输出 `best.pth` 与 `metrics.json`。
+4. 运行 `collect_weight_data.py`，先空载按 `s` 锁基线，再按“输入重量 -> 按 s 采集 -> done 结束”循环。
+5. 运行 `train_weight_model.py`，用 `weight_windows_*.csv` 训练并输出 `best_weight_model.pth`。
+6. 运行 `predict_weight_realtime.py`，先空载按 `s` 锁基线，再放未知重量并按 `s` 输出最终预测。
 
 ---
 
