@@ -16,6 +16,7 @@
 - ID42 目标标记负责主测量：程序用它真实的 50mm 边长估计目标点附近的局部像素/mm。
 - 5 个静态 ArUco 标记负责提供不动参考方向和相机晃动补偿，不再把跨中目标强行投到静态板平面上。
 - ChArUco 只用于相机内参与畸变标定；若使用 `target-local-scale`，它不是绝对必要，但仍建议保留以减少边缘畸变。
+- ArUco/ChArUco 检测均使用 OpenCV，当前配置为 SUBPIX 精度优先角点精修；没有引入 AprilTag 检测器，也不依赖额外权重。
 
 ## 2. 代码结构与职责
 
@@ -24,15 +25,20 @@
 - yolo/run_deflection_realtime.py：实时测量入口。
 - yolo/run_deflection_offline.py：离线复算入口。
 - yolo/collect_weight_data.py：砝码重量数据采集入口。
-- yolo/train_weight_model.py：砝码重量模型训练入口。
+- yolo/train_bridge_task_models.py：三任务桥梁模型训练入口（推荐）。
+- yolo/train_weight_model.py：旧版单任务重量模型训练入口。
 - yolo/predict_weight_realtime.py：实时重量预测入口。
+- yolo/predict_deflection_from_weight.py：任务 B，给定重量预测激光标准挠度。
+- yolo/predict_standard_deflection_from_phone.py：任务 C，手机挠度校正为激光标准挠度。
 - yolo/train_midpoint_yolo.py：旧兼容入口，仅提示迁移到三段式流程。
 - yolo/bridge_ai/config.py：静态标记布局定义与读写。
+- yolo/bridge_ai/aruco_utils.py：OpenCV ArUco 精度优先检测参数。
 - yolo/bridge_ai/geometry.py：ArUco 检测 + 单应矩阵解算。
 - yolo/bridge_ai/detection.py：跨中目标检测（YOLO 主路径 + ArUco ID42 回退）。
 - yolo/bridge_ai/deflection.py：基线标定与卡尔曼滤波。
 - yolo/bridge_ai/io_utils.py：视频源、CSV、视频写出工具。
 - yolo/bridge_ai/calibration.py：ChArUco 标定、相机内参保存与去畸变。
+- yolo/bridge_ai/bridge_task_models.py：三任务模型训练、保存、加载和预测。
 
 ## 3. 环境准备
 
@@ -292,6 +298,9 @@ conda run --no-capture-output -n fai python yolo/run_deflection_realtime.py \
   --deadband-mm 0.2 \
   --smooth-window 9 \
   --local-scale-mode baseline \
+  --target-only-fallback true \
+  --static-pose-correction true \
+  --static-assist-min-points 4 \
   --deflection-scale 1.0 \
   --measurement-method target-local-scale \
   --calibration-mode use \
@@ -309,6 +318,9 @@ conda run --no-capture-output -n fai python yolo/run_deflection_realtime.py \
   --deadband-mm 0.2 \
   --smooth-window 9 \
   --local-scale-mode baseline \
+  --target-only-fallback true \
+  --static-pose-correction true \
+  --static-assist-min-points 4 \
   --deflection-scale 1.0 \
   --measurement-method target-local-scale \
   --calibration-mode recalibrate \
@@ -325,6 +337,9 @@ conda run --no-capture-output -n fai python yolo/run_deflection_realtime.py \
   --deadband-mm 0.2 \
   --smooth-window 9 \
   --local-scale-mode baseline \
+  --target-only-fallback true \
+  --static-pose-correction true \
+  --static-assist-min-points 4 \
   --deflection-scale 1.0 \
   --measurement-method target-local-scale \
   --calibration-mode use \
@@ -353,8 +368,13 @@ conda run --no-capture-output -n fai python yolo/run_deflection_realtime.py \
 - waiting-start：等待按 `s` 开始基线（仅 manual 模式）。
 - tracking:yolo：YOLO 检测并跟踪成功。
 - tracking:fallback-aruco：YOLO 未用上，使用 ID42 回退标记。
-- missing:no-static-markers：静态标定点不足，无法解算。
-- missing:low-homography-quality：静态点已识别，但几何质量不达标（RMSE/内点比/点数门控失败）。
+- tracking:static-pose：使用静态标 PnP 姿态辅助，静态平面方向已参与测量方向计算。
+- tracking:static-pose-low-quality：静态点几何质量一般，但仍使用静态姿态方向辅助；ID42 自身 50mm 仍是主尺度来源。
+- tracking:static-homography-low-quality：没有可用 PnP 姿态时，用较低质量 homography 的静态方向辅助。
+- tracking:target-only-no-static-markers：静态 5 点不足，但已降级为仅用 ID42 + 图像竖直方向继续输出挠度。
+- tracking:target-only-low-homography-quality：静态点质量不足，但已降级为仅用 ID42 + 图像竖直方向继续输出挠度。
+- missing:no-static-markers：静态标定点不足且没有启用/无法进入 target-only 降级。
+- missing:low-homography-quality：静态点质量不足且没有启用/无法进入 target-only 降级。
 - missing:\*：目标点缺失，当前帧无有效挠度。
 
 退出按键：q。
@@ -371,17 +391,32 @@ conda run --no-capture-output -n fai python yolo/run_deflection_realtime.py \
 - `deadband-mm`：静止死区阈值，默认 `0.2mm`。小于该幅度的短时抖动会被保持为上一稳定值。
 - `smooth-window`：平滑窗口帧数，默认 `9`。数值越大越稳，但响应越慢。
 - `local-scale-mode`：推荐 `baseline`。基线阶段锁定 ID42 的局部比例尺，后续只测相对像素位移，避免桥受力后 ID42 轻微转动导致比例尺漂移。
+- `target-only-fallback`：默认 `true`。静态点缺失或质量不足时，仍然用 ID42 自身比例尺和图像竖直方向输出数据；界面会提示 target-only 状态。
+- `static-pose-correction`：默认 `true`。有 ChArUco 相机标定时，用静态 40mm 标的角点做 PnP，估计静态平面在相机中的姿态，并把静态平面的竖直方向投影到图像里参与 ID42 挠度方向计算。
+- `static-assist-min-points`：默认 `4`。只要识别到 1 个静态标的 4 个角点，就可以尝试提供静态姿态/方向辅助；识别到更多静态标时会更稳。
 - `deflection-scale`：赛前固定比例修正系数，默认 `1.0`。比赛现场不要用真值临时调整它。
 - `measurement-method`：推荐 `target-local-scale`。它在基线阶段记录 ID42 中心投影位置，tracking 阶段只把“当前中心 - 基线中心”的像素差换算成毫米；ID42 的 50mm 真实边长用于计算目标附近局部比例，5 个静态点提供参考方向。
+- 静态点质量门控默认已放宽：`min-used-points=12`、`max-rmse=4.0`、`min-inlier-ratio=0.45`。如果静态点没过门控，默认会进入 target-only 降级并继续输出数据。
 
 重要算法说明：
 
 - `homography` 方法假设跨中目标与 5 个静态标记在同一平面；若目标贴在桥上、静态标记贴在后方背板上，两者不共面，真实 40mm 位移可能只被算成几 mm。
 - `target-local-scale` 方法不需要比赛现场已知位移；它只依赖赛前已经确认准确的 ID42=50mm 和静态点=40mm。
+- 现在 5 个静态点是“软增强”：能识别时用于估计静态平面的投影方向、相机相对静态平面的 tilt/roll，并把这个方向带入 ID42 局部尺度计算；识别不好时不会直接中断主测量。
+- debug 面板中的 `Static axis` 为 `pose` 表示使用了 PnP 姿态辅助；`homography` 表示使用了静态点平面映射方向；`none` 表示当前帧只能用 ID42 图像竖直方向降级。
+- debug 面板中的 `Plane tilt(deg)` 是静态平面法线相对相机光轴的倾斜角，`Static roll(deg)` 是静态平面竖直方向相对屏幕竖直方向的夹角。它们用于诊断机位是否过斜，不是额外需要手算的参数。
+- 当前 OpenCV ArUco 参数偏向精度：`CORNER_REFINE_SUBPIX`、`cornerRefinementWinSize=7`、`cornerRefinementMaxIterations=80`、`cornerRefinementMinAccuracy=0.001`、`perspectiveRemovePixelPerCell=10`、`perspectiveRemoveIgnoredMarginPerCell=0.18`、`errorCorrectionRate=0.3`。这会牺牲一点速度，换取更稳定的角点和更保守的 ID 解码。
 - 该方法不会把局部比例尺作用到整张画面的绝对坐标上，因此比上一版更不容易出现 `5.0cm -> 5.3cm` 这种固定倍率偏差。
 - 默认 `local-scale-mode=baseline` 会使用基线阶段的 ID42 比例尺；如果你确认 ID42 只平移、不转动，这通常比使用当前帧比例尺更稳。
 - `target-pnp` 方法只使用 ID42 与相机内参，适合相机完全固定且 ChArUco 标定非常可靠的情况。
 - `static-compensated-pnp` 会使用相机内参、ID42 和 5 个静态点做 3D 位姿解算；若 ChArUco 标定或相机焦距状态变化，它可能出现稳定比例误差。
+
+静态标和 ID42 是否必须在同一竖直平面：
+
+- 最理想：5 个静态 40mm 标和 ID42 主标在同一个竖直平面，或者至少互相平行且深度差很小。这样静态姿态方向、ID42 局部比例尺、实际挠度方向三者一致，精度最高。
+- 可以接受：静态标在旁边作为方向参考，ID42 贴在真实测点上；此时 ID42 自己的 50mm 边长仍提供局部尺度，静态标主要提供“竖直方向/相机倾斜”参考。
+- 不推荐：静态标在后方很远的背板上，ID42 在前方桥面上，且两者平面夹角明显不同。这样静态方向参考可能和 ID42 实际运动方向不一致，只能作为弱辅助。
+- 不能做到共面时，至少让静态 A4 板与 ID42 主标尽量平行，并且让两者都完整、清晰地出现在画面中。
 
 固定比例误差判断：
 
@@ -470,6 +505,9 @@ conda run --no-capture-output -n fai python yolo/collect_weight_data.py \
   --source 0 \
   --measurement-method target-local-scale \
   --local-scale-mode baseline \
+  --target-only-fallback true \
+  --static-pose-correction true \
+  --static-assist-min-points 4 \
   --target-marker-size 50.0 \
   --calibration-mode use \
   --calibration-file yolo/artifacts/camera_calibration.npz \
@@ -482,69 +520,121 @@ conda run --no-capture-output -n fai python yolo/collect_weight_data.py \
 
 1. 启动后先保持**空载**，在视频窗口按 `s` 锁定基线。
 2. 基线完成后，命令行会提示输入重量，单位是 g，例如 `200`。
-3. 放稳当前砝码或小车后，在视频窗口按 `s` 开始采集。
-4. 采集达到 `--capture-seconds` 或 `--min-valid-frames` 后自动结束；也可以按 `e` 提前结束。
-5. 换下一个重量，继续在命令行输入重量。
-6. 所有重量采完后，命令行输入 `done` 保存数据并退出。
+3. 放稳当前砝码或小车后，先看窗口里的绿色挠度曲线；曲线平稳后，在视频窗口按 `s` 开始采集。
+4. `--capture-seconds` 是最短采集时长；如果时间到了但有效帧不足，程序会继续采到 `--min-valid-frames`，不会直接丢弃。
+5. 有效帧足够后自动结束；也可以按 `e` 提前结束，但只有有效帧足够时才会真正结束。
+6. 命令行会提示输入激光测距仪的标准挠度，单位是 mm，例如 `-12.35`。
+7. 换下一个重量，继续在命令行输入重量。
+8. 所有重量采完后，命令行输入 `done` 保存数据并退出。
 
 窗口按键：
 
 - `s`：开始当前阶段。基线阶段表示开始空载基线；采集阶段表示开始采集当前重量。
-- `e`：提前结束当前重量采集。
+- `e`：提前结束当前重量采集；如果有效帧不足，程序会提示并继续采集。
 - `q`：中止整个采集流程。
 
 采集输出：
 
-- `yolo/results/weight_raw_<时间>.csv`：逐帧挠度、检测状态、质量指标。
-- `yolo/results/weight_windows_<时间>.csv`：每轮重量窗口的聚合特征，用于训练。
+- `yolo/results/weight_raw_<时间>.csv`：逐帧手机挠度、重量、标准挠度、检测状态、质量指标。
+- `yolo/results/weight_windows_<时间>.csv`：每轮重量窗口的聚合特征，至少包含重量、手机平均挠度、激光标准挠度。
 - `yolo/results/weight_dataset_<时间>.metadata.json`：采集参数、重量档位、文件路径。
+
+关键字段：
+
+- `weightG`：本轮砝码/小车重量，单位 g。
+- `deflectionMeanMm`：手机视觉测得的本轮平均挠度，单位 mm。
+- `standardDeflectionMm`：激光测距仪测得的本轮标准挠度，单位 mm。
+- `phoneMinusStandardMm`：`deflectionMeanMm - standardDeflectionMm`，用于评估手机测量误差。
+- `staticAxisSource`：逐帧静态辅助来源，常见值是 `pose`、`homography`、`none`。
+- `staticPlaneTiltDeg` / `staticRollDeg`：逐帧静态平面姿态诊断值，用来回看机位是否过斜。
+
+说明：`standardDeflectionMm` 会保存下来用于误差分析、赛后校准或后续改进拟合方法；当前重量模型默认仍然只用手机视觉挠度特征预测重量，避免比赛预测时依赖激光测距仪。
 
 建议：
 
 - 每个重量至少采 2 轮；机会少时优先保证每轮稳定，不要追求太多重量档。
 - 每轮采集前等 `Deflection(mm)` 稳定再按 `s`。
+- 激光标准挠度请在同一轮采集完成后立即输入，避免换砝码后混淆。
 - 若 debug 面板里 `Detect`、`Used points`、`RMSE` 明显异常，本轮不要采。
 
-## 11.2 第二步：训练重量模型
+## 11.2 第二步：训练三任务模型（推荐）
+
+现在比赛至少准备三个任务，所以推荐使用新的三任务训练入口：
+
+- 任务 A：手机视觉挠度 `->` 车重。
+- 任务 B：给定重量 `->` 激光标准挠度。
+- 任务 C：手机视觉挠度 `->` 激光标准挠度，用于校正或比较手机测量和激光测距仪的差异。
+
+默认训练集就是最近两组较准数据：
+
+- `yolo/results/weight_windows_20260508_191017.csv`
+- `yolo/results/weight_windows_20260508_194555.csv`
 
 训练命令：
 
 ```bash
-conda run --no-capture-output -n fai python yolo/train_weight_model.py \
-  --windows-csv yolo/results/weight_windows_<时间>.csv \
-  --output-dir yolo/results/weight_model_<时间> \
-  --epochs 500 \
-  --lr 1e-3
+conda run --no-capture-output -n fai python yolo/train_bridge_task_models.py \
+  --windows-csv yolo/results/weight_windows_20260508_191017.csv \
+  --windows-csv yolo/results/weight_windows_20260508_194555.csv \
+  --output-dir yolo/results/bridge_models_final \
+  --epochs 800 \
+  --lr 1e-3 \
+  --seed 42
+```
+
+如果不写 `--windows-csv`，脚本也会默认使用上面两组数据。
+
+训练界面：
+
+- 默认使用 `rich` 彩色表格和进度条显示训练过程。
+- 如果新环境缺少 `rich`，先安装：
+
+```bash
+conda run -n fai python -m pip install rich
+```
+
+- 如果你想回到纯文本输出，可以加：
+
+```bash
+--plain-output
 ```
 
 训练逻辑：
 
-- 默认同时训练两类模型：稳健拟合模型和小 MLP。
-- 稳健拟合包含线性、二次、岭回归，用留一验证选择。
-- 小 MLP 结构为 `input -> 16 -> 8 -> 回归头/分类头`。
-- 最终按留一验证 MAE/RMSE 自动选择最佳模型。
-- 输出同时包含连续重量预测和最接近训练档位。
+- 三个任务分别训练候选模型；每个任务都会同时训练小 MLP 和线性/二次/岭回归兜底模型。
+- 数据很少，所以用留一验证（LOOCV）评估每个样本的预测误差。
+- 最终按 LOOCV MAE/RMSE 自动推荐模型；如果神经网络过拟合，脚本会推荐岭回归。
+- 三个任务都会保留所有候选模型结果，不会只保存一个黑盒结果。
 
-训练输出：
+为什么训练很快：
 
-- `best_weight_model.pth`：预测脚本默认加载的模型文件。
-- `best_weight_model.json`：模型摘要，便于查看。
-- `metrics.json`：MAE、RMSE、R2、逐样本误差。
-- `feature_config.json`：训练使用的特征列表。
-- `label_map.json`：重量档位映射。
+- 当前默认训练集只有 27 个窗口样本，不是几千张图片，也不是训练 YOLO。
+- MLP 只有几层全连接网络，输入最多 11 个特征，所以 800 epoch 几秒到几十秒完成都正常。
+- 判断模型是否靠谱主要看 `metrics.json` 和命令行里的 LOOCV MAE/RMSE/R2，不看训练时间长不长。
 
-命令行会打印每个样本的留一验证误差。若某个样本误差特别大，优先回看对应采集轮次。
+输出文件：
 
-## 11.3 第三步：实时预测重量
+- `model_bundle.pth`：完整三任务模型包，包含神经网络权重，实时预测优先加载这个文件。
+- `model_bundle.json`：去掉神经网络权重后的摘要，方便人工查看。
+- `metrics.json`：三个任务的 MAE、RMSE、R2、最大误差和逐样本误差。
+- `feature_config.json`：手机视觉特征、重量工程特征和默认训练数据。
 
-预测命令：
+旧脚本 `yolo/train_weight_model.py` 仍然可用，但它只负责“手机视觉挠度 `->` 重量”这一个旧任务。最终比赛准备建议优先用 `train_bridge_task_models.py`。
+
+## 11.3 任务 A：实时测挠度并预测车重
+
+三任务模型包可以直接给实时重量预测脚本使用：
 
 ```bash
 conda run --no-capture-output -n fai python yolo/predict_weight_realtime.py \
   --source 0 \
-  --model-path yolo/results/weight_model_<时间>/best_weight_model.pth \
+  --model-path yolo/results/bridge_models_final/model_bundle.pth \
+  --task weight-from-phone \
   --measurement-method target-local-scale \
   --local-scale-mode baseline \
+  --target-only-fallback true \
+  --static-pose-correction true \
+  --static-assist-min-points 4 \
   --calibration-mode use \
   --calibration-file yolo/artifacts/camera_calibration.npz \
   --overlay-level debug
@@ -553,7 +643,7 @@ conda run --no-capture-output -n fai python yolo/predict_weight_realtime.py \
 操作顺序：
 
 1. 启动后先保持空载，在视频窗口按 `s` 锁定基线。
-2. 放上未知重量，等待挠度读数稳定。
+2. 放上未知重量，等待挠度读数和绿色曲线稳定。
 3. 窗口会连续显示实时重量估计，你可以观察稳定值。
 4. 想要最终输出时按 `s`，程序会采集一个稳定窗口并在命令行输出最终重量。
 5. 按 `q` 退出。
@@ -565,13 +655,48 @@ conda run --no-capture-output -n fai python yolo/predict_weight_realtime.py \
 - `FINAL`：按 `s` 后稳定窗口的最终预测。
 - debug 面板会显示挠度标准差、漂移等稳定性信息。
 
-## 11.4 比赛推荐流程
+## 11.4 任务 B：给定重量预测激光标准挠度
+
+如果比赛不给手机测量机会，只给重量，就用任务 B：
+
+```bash
+conda run --no-capture-output -n fai python yolo/predict_deflection_from_weight.py \
+  --model-path yolo/results/bridge_models_final/model_bundle.pth \
+  --weight-g 4300
+```
+
+输出含义：
+
+- `Predicted standard deflection`：预测的激光标准挠度，单位 mm。
+- `Model`：任务名，固定为 `deflection_from_weight`。
+- `Recommended candidate`：当前模型包推荐使用的候选模型，例如 `ridge` 或 `mlp_regression`。
+
+## 11.5 任务 C：手机挠度校正为激光标准挠度
+
+如果现场同时有手机视觉和激光测距仪，或者需要比较两者误差，就用任务 C。它不会重新检测视频，只读取已有的窗口特征 CSV：
+
+```bash
+conda run --no-capture-output -n fai python yolo/predict_standard_deflection_from_phone.py \
+  --model-path yolo/results/bridge_models_final/model_bundle.pth \
+  --windows-csv yolo/results/weight_windows_20260508_194555.csv \
+  --output-csv yolo/results/phone_laser_correction.csv
+```
+
+输出含义：
+
+- `phone`：手机视觉测得的平均挠度，来自 `deflectionMeanMm`。
+- `predStandard`：模型预测的激光标准挠度。
+- `phone-standard`：手机视觉挠度减去预测标准挠度，可用于看手机测量偏差。
+
+## 11.6 比赛推荐流程
 
 1. 先用第 8 节确认挠度检测稳定、误差可接受。
 2. 空载启动 `collect_weight_data.py`，按 `s` 锁定基线。
-3. 按重量档逐轮采集，保存 `weight_raw` 和 `weight_windows`。
-4. 用 `train_weight_model.py` 训练，检查 `metrics.json` 中留一验证误差。
-5. 比赛预测时使用 `predict_weight_realtime.py`，仍然先空载按 `s` 锁定基线，再放未知重量。
+3. 按重量档逐轮采集，同时输入激光标准挠度，保存 `weight_raw` 和 `weight_windows`。
+4. 用 `train_bridge_task_models.py` 训练三任务模型，检查 `metrics.json` 中三个任务的留一验证误差。
+5. 任务 A 用 `predict_weight_realtime.py`，先空载按 `s` 锁定基线，再放未知重量。
+6. 任务 B 用 `predict_deflection_from_weight.py`，直接输入重量预测标准挠度。
+7. 任务 C 用 `predict_standard_deflection_from_phone.py`，把手机视觉窗口数据校正到激光标准挠度。
 
 ## 12. 精度验收流程（建议按此提交实验结果）
 
@@ -604,9 +729,11 @@ conda run --no-capture-output -n fai python yolo/predict_weight_realtime.py \
 
 ## 13.2 挠度输出为 nan 或大量 missing
 
-1. 确认状态是否 missing:no-static-markers。
-2. 增大标记在画面中的像素尺寸（靠近相机或放大打印）。
-3. 降低反光并增强均匀照明。
+1. 如果状态是 `tracking:target-only-*`，说明已经降级成功，数据仍然会输出；只是没有静态 5 点的参考方向/相机运动补偿。
+2. 如果状态是 `missing:no-static-markers` 或 `missing:low-homography-quality`，先确认 ID42 是否完整入镜，因为 target-only 降级也需要 ID42。
+3. 增大标记在画面中的像素尺寸（靠近相机或放大打印）。
+4. 降低反光并增强均匀照明。
+5. 临时救场可继续放宽，例如加 `--max-rmse 5.0 --min-inlier-ratio 0.35`，但会降低相机运动补偿和参考方向稳定性。
 
 ## 13.3 YOLO 无法稳定识别
 

@@ -49,6 +49,7 @@ def computeQuality(rmsePx: float | None, inlierRatio: float | None, usedPoints: 
 def computeWindowFeatures(
     frames: Iterable[WeightSampleFrame],
     weightG: float | None = None,
+    standardDeflectionMm: float | None = None,
     sampleId: str | None = None,
 ) -> dict:
     frameList = list(frames)
@@ -84,6 +85,9 @@ def computeWindowFeatures(
     }
     if weightG is not None:
         row["weightG"] = float(weightG)
+    if standardDeflectionMm is not None:
+        row["standardDeflectionMm"] = float(standardDeflectionMm)
+        row["phoneMinusStandardMm"] = float(row["deflectionMeanMm"] - standardDeflectionMm)
     return row
 
 

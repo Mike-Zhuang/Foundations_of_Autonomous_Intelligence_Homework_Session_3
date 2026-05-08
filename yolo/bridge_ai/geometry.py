@@ -6,6 +6,7 @@ from typing import Dict, Optional, Tuple
 import cv2
 import numpy as np
 
+from bridge_ai.aruco_utils import buildPrecisionArucoDetectorParameters
 from bridge_ai.config import MarkerLayout
 
 
@@ -20,11 +21,22 @@ class HomographyResult:
     worldPoints: list[Tuple[float, float]]
 
 
+@dataclass
+class StaticPoseInfo:
+    rvec: np.ndarray
+    tvec: np.ndarray
+    usedPointCount: int
+    reprojectionRmsePx: Optional[float]
+    planeTiltDeg: float
+    xTiltDeg: float
+    yTiltDeg: float
+    rollDeg: float
+
+
 class ArucoStaticSolver:
     def __init__(self, dictionaryName: str) -> None:
         dictionary = cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, dictionaryName))
-        params = cv2.aruco.DetectorParameters()
-        params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+        params = buildPrecisionArucoDetectorParameters()
         self.detector = cv2.aruco.ArucoDetector(dictionary, params)
 
     def solveHomography(self, frame: np.ndarray, layout: MarkerLayout) -> HomographyResult:
@@ -60,7 +72,7 @@ class ArucoStaticSolver:
                 imagePoints.append((float(pixelCorner[0]), float(pixelCorner[1])))
                 worldPoints.append((float(worldCorner[0]), float(worldCorner[1])))
 
-        if len(imagePoints) < 8:
+        if len(imagePoints) < 4:
             return HomographyResult(
                 homography=None,
                 foundMarkerIds=foundIds,
@@ -74,7 +86,10 @@ class ArucoStaticSolver:
         imageArray = np.asarray(imagePoints, dtype=np.float32)
         worldArray = np.asarray(worldPoints, dtype=np.float32)
 
-        homography, mask = cv2.findHomography(imageArray, worldArray, cv2.RANSAC, ransacReprojThreshold=2.5)
+        if len(imagePoints) == 4:
+            homography, mask = cv2.findHomography(imageArray, worldArray, 0)
+        else:
+            homography, mask = cv2.findHomography(imageArray, worldArray, cv2.RANSAC, ransacReprojThreshold=3.5)
         if homography is None:
             return HomographyResult(
                 homography=None,
@@ -169,26 +184,136 @@ def estimateStaticBoardPose(
     homographyResult: HomographyResult,
     cameraMatrix: np.ndarray,
 ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
-    if len(homographyResult.imagePoints) < 8 or len(homographyResult.worldPoints) < 8:
+    poseInfo = estimateStaticPoseInfo(homographyResult, cameraMatrix)
+    if poseInfo is None:
+        return None
+    return poseInfo.rvec, poseInfo.tvec
+
+
+def estimateStaticPoseInfo(
+    homographyResult: HomographyResult,
+    cameraMatrix: np.ndarray,
+    minPointCount: int = 4,
+) -> Optional[StaticPoseInfo]:
+    if len(homographyResult.imagePoints) < minPointCount or len(homographyResult.worldPoints) < minPointCount:
         return None
 
     objectPoints = np.asarray(
         [(xWorld, yWorld, 0.0) for xWorld, yWorld in homographyResult.worldPoints],
         dtype=np.float32,
-    ).reshape(-1, 1, 3)
-    imagePoints = np.asarray(homographyResult.imagePoints, dtype=np.float32).reshape(-1, 1, 2)
+    )
+    imagePoints = np.asarray(homographyResult.imagePoints, dtype=np.float32)
     distCoeffs = np.zeros((5, 1), dtype=np.float64)
 
-    ok, rvec, tvec = cv2.solvePnP(
-        objectPoints,
-        imagePoints,
-        cameraMatrix,
-        distCoeffs,
-        flags=cv2.SOLVEPNP_ITERATIVE,
-    )
+    ok = False
+    rvec = None
+    tvec = None
+    if len(imagePoints) >= 8 and hasattr(cv2, "solvePnPRansac"):
+        ok, rvec, tvec, inliers = cv2.solvePnPRansac(
+            objectPoints,
+            imagePoints,
+            cameraMatrix,
+            distCoeffs,
+            iterationsCount=100,
+            reprojectionError=5.0,
+            confidence=0.99,
+            flags=cv2.SOLVEPNP_ITERATIVE,
+        )
+        if ok and inliers is not None and len(inliers) < minPointCount:
+            ok = False
+
+    if not ok:
+        flags = cv2.SOLVEPNP_ITERATIVE
+        if len(imagePoints) == 4 and hasattr(cv2, "SOLVEPNP_IPPE"):
+            flags = cv2.SOLVEPNP_IPPE
+        ok, rvec, tvec = cv2.solvePnP(
+            objectPoints,
+            imagePoints,
+            cameraMatrix,
+            distCoeffs,
+            flags=flags,
+        )
+
     if not ok:
         return None
-    return rvec, tvec
+
+    projected, _ = cv2.projectPoints(objectPoints, rvec, tvec, cameraMatrix, distCoeffs)
+    projected2d = projected.reshape(-1, 2)
+    error = projected2d - imagePoints.reshape(-1, 2)
+    rmse = float(np.sqrt(np.mean(np.sum(error * error, axis=1))))
+
+    rotation, _ = cv2.Rodrigues(rvec)
+    normal = rotation @ np.asarray([0.0, 0.0, 1.0], dtype=np.float64)
+    normalNorm = float(np.linalg.norm(normal))
+    if normalNorm < 1e-9:
+        return None
+    normal = normal / normalNorm
+    absNz = float(np.clip(abs(normal[2]), 0.0, 1.0))
+    planeTiltDeg = float(np.degrees(np.arccos(absNz)))
+    xTiltDeg = float(np.degrees(np.arctan2(normal[0], max(abs(normal[2]), 1e-9))))
+    yTiltDeg = float(np.degrees(np.arctan2(-normal[1], max(abs(normal[2]), 1e-9))))
+
+    axisResult = estimateStaticPosePixelAxis(
+        StaticPoseInfo(
+            rvec=rvec,
+            tvec=tvec,
+            usedPointCount=len(imagePoints),
+            reprojectionRmsePx=rmse,
+            planeTiltDeg=planeTiltDeg,
+            xTiltDeg=xTiltDeg,
+            yTiltDeg=yTiltDeg,
+            rollDeg=0.0,
+        ),
+        cameraMatrix,
+    )
+    rollDeg = 0.0
+    if axisResult is not None:
+        _, axisUnit = axisResult
+        # axisUnit 是静态平面 Y 轴在图像上的方向；这里给出它相对屏幕竖直向下的夹角。
+        rollDeg = float(np.degrees(np.arctan2(axisUnit[0], axisUnit[1])))
+
+    return StaticPoseInfo(
+        rvec=rvec,
+        tvec=tvec,
+        usedPointCount=len(imagePoints),
+        reprojectionRmsePx=rmse,
+        planeTiltDeg=planeTiltDeg,
+        xTiltDeg=xTiltDeg,
+        yTiltDeg=yTiltDeg,
+        rollDeg=rollDeg,
+    )
+
+
+def estimateStaticPosePixelAxis(
+    poseInfo: StaticPoseInfo,
+    cameraMatrix: np.ndarray,
+    originWorldMm: Tuple[float, float] = (105.0, 148.0),
+    yStepMm: float = 40.0,
+) -> Optional[Tuple[Tuple[float, float], Tuple[float, float]]]:
+    objectPoints = np.asarray(
+        [
+            (originWorldMm[0], originWorldMm[1], 0.0),
+            (originWorldMm[0], originWorldMm[1] + yStepMm, 0.0),
+        ],
+        dtype=np.float32,
+    )
+    imagePoints, _ = cv2.projectPoints(
+        objectPoints,
+        poseInfo.rvec,
+        poseInfo.tvec,
+        cameraMatrix,
+        np.zeros((5, 1), dtype=np.float64),
+    )
+    points = imagePoints.reshape(2, 2)
+    axis = points[1] - points[0]
+    axisNorm = float(np.linalg.norm(axis))
+    if axisNorm < 1e-6:
+        return None
+    axisUnit = axis / axisNorm
+    return (
+        (float(points[0][0]), float(points[0][1])),
+        (float(axisUnit[0]), float(axisUnit[1])),
+    )
 
 
 def cameraPointToStaticWorld(

@@ -6,6 +6,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from bridge_ai.aruco_utils import buildPrecisionArucoDetectorParameters
+
 
 @dataclass
 class CameraCalibration:
@@ -55,9 +57,13 @@ def runCharucoCalibration(
 ) -> CameraCalibration:
     dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_5X5_250)
     board = cv2.aruco.CharucoBoard((squaresX, squaresY), squareLengthMm, markerLengthMm, dictionary)
-    detectorParams = cv2.aruco.DetectorParameters()
+    detectorParams = buildPrecisionArucoDetectorParameters()
     detector = cv2.aruco.ArucoDetector(dictionary, detectorParams)
-    charucoDetector = cv2.aruco.CharucoDetector(board) if hasattr(cv2.aruco, "CharucoDetector") else None
+    charucoDetector = (
+        cv2.aruco.CharucoDetector(board, detectorParams=detectorParams)
+        if hasattr(cv2.aruco, "CharucoDetector")
+        else None
+    )
 
     allCharucoCorners: list[np.ndarray] = []
     allCharucoIds: list[np.ndarray] = []

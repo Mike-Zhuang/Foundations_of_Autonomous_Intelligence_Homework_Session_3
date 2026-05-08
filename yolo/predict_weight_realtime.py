@@ -16,13 +16,15 @@ from bridge_ai.geometry import drawOverlay
 from bridge_ai.io_utils import openVideoSource
 from bridge_ai.realtime_measurement import MeasurementConfig, MeasurementFrame, RealtimeDeflectionMeasurer
 from bridge_ai.weight_features import WeightSampleFrame, computeQuality, computeWindowFeatures
+from bridge_ai.bridge_task_models import predictWeightFromPhone
 from bridge_ai.weight_model import loadModel, predictWeight
 
 
 def parseArgs() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="实时挠度检测 + 砝码重量模型预测")
     parser.add_argument("--source", default="0")
-    parser.add_argument("--model-path", required=True, help="train_weight_model.py 输出的 best_weight_model.pth/json")
+    parser.add_argument("--model-path", required=True, help="best_weight_model.pth/json 或三任务 model_bundle.pth/json")
+    parser.add_argument("--task", choices=["weight-from-phone"], default="weight-from-phone", help="三任务模型包中的预测任务")
     parser.add_argument("--yolo-model", default="yolov8n.pt")
     parser.add_argument("--layout", default="yolo/artifacts/static_marker_layout.json")
     parser.add_argument("--target-class", default="midpoint_marker")
@@ -39,9 +41,22 @@ def parseArgs() -> argparse.Namespace:
     parser.add_argument("--deadband-mm", type=float, default=0.2)
     parser.add_argument("--smooth-window", type=int, default=9)
     parser.add_argument("--deflection-scale", type=float, default=1.0)
-    parser.add_argument("--min-used-points", type=int, default=16)
-    parser.add_argument("--max-rmse", type=float, default=2.6)
-    parser.add_argument("--min-inlier-ratio", type=float, default=0.65)
+    parser.add_argument("--min-used-points", type=int, default=12)
+    parser.add_argument("--max-rmse", type=float, default=4.0)
+    parser.add_argument("--min-inlier-ratio", type=float, default=0.45)
+    parser.add_argument(
+        "--target-only-fallback",
+        choices=["true", "false"],
+        default="true",
+        help="静态点不可用时，是否降级为仅用 ID42 + 图像竖直方向继续输出数据",
+    )
+    parser.add_argument(
+        "--static-pose-correction",
+        choices=["true", "false"],
+        default="true",
+        help="有相机标定时，是否用静态标 PnP 姿态修正测量方向",
+    )
+    parser.add_argument("--static-assist-min-points", type=int, default=4, help="静态姿态辅助所需最少角点数，4 表示 1 个静态标即可辅助")
     parser.add_argument("--predict-seconds", type=float, default=6.0)
     parser.add_argument("--min-valid-frames", type=int, default=90)
     return parser.parse_args()
@@ -77,6 +92,9 @@ def makeMeasurementConfig(args: argparse.Namespace) -> MeasurementConfig:
         minUsedPoints=args.min_used_points,
         maxRmse=args.max_rmse,
         minInlierRatio=args.min_inlier_ratio,
+        targetOnlyFallback=args.target_only_fallback == "true",
+        staticPoseCorrection=args.static_pose_correction == "true",
+        staticAssistMinPoints=args.static_assist_min_points,
     )
 
 
@@ -86,8 +104,13 @@ def printGuide(args: argparse.Namespace, modelPayload: dict) -> None:
     print("阶段 2：放上未知重量，等读数稳定。窗口会连续显示实时估计。", flush=True)
     print("阶段 3：按 s 采集稳定窗口并输出最终预测；按 q 退出。", flush=True)
     print(f"模型: {args.model_path}", flush=True)
-    print(f"模型类型: {modelPayload.get('modelType')}", flush=True)
-    print(f"训练档位(g): {modelPayload.get('weightsG')}", flush=True)
+    if modelPayload.get("bundleType") == "bridge_task_models":
+        taskPayload = modelPayload["tasks"]["weight_from_phone"]
+        print("模型包: bridge_task_models", flush=True)
+        print(f"任务: {args.task}, 推荐候选: {taskPayload['recommended']}", flush=True)
+    else:
+        print(f"模型类型: {modelPayload.get('modelType')}", flush=True)
+        print(f"训练档位(g): {modelPayload.get('weightsG')}", flush=True)
     print("============================================\n", flush=True)
 
 
@@ -111,6 +134,8 @@ def predictFromFrames(modelPayload: dict, frames: list[WeightSampleFrame]) -> tu
     if validCount < 5:
         return None, None
     featureRow = computeWindowFeatures(frames, sampleId="predict_window")
+    if modelPayload.get("bundleType") == "bridge_task_models":
+        return predictWeightFromPhone(modelPayload, featureRow), featureRow
     return predictWeight(modelPayload, featureRow), featureRow
 
 
@@ -161,6 +186,9 @@ def drawPrediction(
         f"Used points: {measurement.homographyResult.usedPointCount}",
         f"RMSE(px): {measurement.homographyResult.reprojectionRmsePx}",
         f"Inlier: {measurement.homographyResult.inlierRatio}",
+        f"Static axis: {measurement.staticAxisSource}",
+        f"Plane tilt(deg): {measurement.staticPoseInfo.planeTiltDeg if measurement.staticPoseInfo else None}",
+        f"Static roll(deg): {measurement.staticPoseInfo.rollDeg if measurement.staticPoseInfo else None}",
         f"Raw(mm): {measurement.state.rawMm}",
         f"Filtered(mm): {measurement.state.filteredMm}",
         f"Feature std(mm): {featureRow.get('deflectionStdMm') if featureRow else None}",

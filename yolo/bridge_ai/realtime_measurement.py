@@ -13,10 +13,13 @@ from bridge_ai.detection import DetectionResult, MidpointTargetDetector
 from bridge_ai.geometry import (
     ArucoStaticSolver,
     HomographyResult,
+    StaticPoseInfo,
     cameraPointToStaticWorld,
     estimateMarkerPoseTvec,
     estimateStaticBoardPose,
     estimateStaticPixelAxis,
+    estimateStaticPoseInfo,
+    estimateStaticPosePixelAxis,
     estimateTargetLocalCoordinateY,
 )
 
@@ -31,9 +34,12 @@ class MeasurementConfig:
     deflectionScale: float = 1.0
     measurementMethod: str = "target-local-scale"
     targetMarkerSizeMm: float = 50.0
-    minUsedPoints: int = 16
-    maxRmse: float = 2.6
-    minInlierRatio: float = 0.65
+    minUsedPoints: int = 12
+    maxRmse: float = 4.0
+    minInlierRatio: float = 0.45
+    targetOnlyFallback: bool = True
+    staticPoseCorrection: bool = True
+    staticAssistMinPoints: int = 4
 
 
 @dataclass
@@ -49,6 +55,8 @@ class MeasurementFrame:
     targetPxPerMm: Optional[float]
     poseTvec: Optional[Tuple[float, float, float]]
     compensatedWorldPoint: Optional[Tuple[float, float, float]]
+    staticPoseInfo: Optional[StaticPoseInfo] = None
+    staticAxisSource: str = "none"
 
 
 class RealtimeDeflectionMeasurer:
@@ -92,25 +100,47 @@ class RealtimeDeflectionMeasurer:
         worldPoint = None
         poseTvec = None
         staticBoardPose = None
+        staticPoseInfo = None
+        staticAxisSource = "none"
         compensatedWorldPoint = None
         targetPositionPx = None
         targetPxPerMm = None
+        targetOnlyPositionPx = None
+        targetOnlyPxPerMm = None
         measurementYmm = None
         measurementMethod = "none"
+        targetOnlyReason = None
 
         if homographyResult.homography is not None and detection.centerPixel is not None and not isLowQuality:
             worldPoint = self.solver.pixelToWorld(homographyResult.homography, detection.centerPixel)
 
-        if self.calibration is not None and homographyResult.usedPointCount >= self.config.minUsedPoints and not isLowQuality:
+        if (
+            self.config.staticPoseCorrection
+            and self.calibration is not None
+            and homographyResult.usedPointCount >= self.config.staticAssistMinPoints
+        ):
+            staticPoseInfo = estimateStaticPoseInfo(
+                homographyResult,
+                self.calibration.cameraMatrix,
+                minPointCount=self.config.staticAssistMinPoints,
+            )
+            if staticPoseInfo is not None:
+                staticBoardPose = (staticPoseInfo.rvec, staticPoseInfo.tvec)
+        elif self.calibration is not None and homographyResult.usedPointCount >= self.config.minUsedPoints and not isLowQuality:
             staticBoardPose = estimateStaticBoardPose(homographyResult, self.calibration.cameraMatrix)
 
         if (
             self.config.measurementMethod == "target-local-scale"
-            and homographyResult.homography is not None
             and detection.markerCorners is not None
-            and not isLowQuality
         ):
-            staticPixelAxis = estimateStaticPixelAxis(homographyResult.homography)
+            staticPixelAxis = None
+            if staticPoseInfo is not None and self.calibration is not None:
+                staticPixelAxis = estimateStaticPosePixelAxis(staticPoseInfo, self.calibration.cameraMatrix)
+                if staticPixelAxis is not None:
+                    staticAxisSource = "pose"
+            if staticPixelAxis is None and homographyResult.homography is not None:
+                staticPixelAxis = estimateStaticPixelAxis(homographyResult.homography)
+                staticAxisSource = "homography" if staticPixelAxis is not None else "none"
             if staticPixelAxis is not None:
                 originPixel, axisUnit = staticPixelAxis
                 localScaleResult = estimateTargetLocalCoordinateY(
@@ -122,6 +152,29 @@ class RealtimeDeflectionMeasurer:
                 if localScaleResult is not None:
                     targetPositionPx, targetPxPerMm = localScaleResult
                     measurementMethod = "target-local-scale"
+
+        if (
+            self.config.measurementMethod == "target-local-scale"
+            and self.config.targetOnlyFallback
+            and detection.markerCorners is not None
+        ):
+            localScaleResult = estimateTargetLocalCoordinateY(
+                markerCorners=detection.markerCorners,
+                markerSizeMm=self.config.targetMarkerSizeMm,
+                originPixel=(0.0, 0.0),
+                axisUnit=(0.0, 1.0),
+            )
+            if localScaleResult is not None:
+                targetOnlyPositionPx, targetOnlyPxPerMm = localScaleResult
+                if targetPositionPx is None:
+                    targetPositionPx, targetPxPerMm = localScaleResult
+                    measurementMethod = "target-only-image-y"
+                    if homographyResult.homography is None:
+                        targetOnlyReason = "no-static-markers"
+                    elif isLowQuality:
+                        targetOnlyReason = "low-homography-quality"
+                    else:
+                        targetOnlyReason = "static-axis-unavailable"
 
         if (
             self.config.measurementMethod in ("static-compensated-pnp", "target-pnp")
@@ -142,7 +195,7 @@ class RealtimeDeflectionMeasurer:
                     measurementYmm = poseTvec[1]
                     measurementMethod = "target-pnp"
 
-        if measurementYmm is None and worldPoint is not None:
+        if measurementYmm is None and worldPoint is not None and measurementMethod == "none":
             measurementYmm = worldPoint[1]
             measurementMethod = "homography"
 
@@ -151,11 +204,16 @@ class RealtimeDeflectionMeasurer:
             measurementYmm=measurementYmm,
             targetPositionPx=targetPositionPx,
             targetPxPerMm=targetPxPerMm,
+            targetOnlyPositionPx=targetOnlyPositionPx,
+            targetOnlyPxPerMm=targetOnlyPxPerMm,
             timeSec=self.elapsedSec,
             confidence=detection.confidence,
             detectionStatus=detection.status,
             homographyResult=homographyResult,
             isLowQuality=isLowQuality,
+            measurementMethod=measurementMethod,
+            targetOnlyReason=targetOnlyReason,
+            staticAxisSource=staticAxisSource,
         )
 
         return MeasurementFrame(
@@ -170,6 +228,8 @@ class RealtimeDeflectionMeasurer:
             targetPxPerMm=targetPxPerMm,
             poseTvec=poseTvec,
             compensatedWorldPoint=compensatedWorldPoint,
+            staticPoseInfo=staticPoseInfo,
+            staticAxisSource=staticAxisSource,
         )
 
     def _isLowQuality(self, homographyResult: HomographyResult) -> bool:
@@ -192,11 +252,16 @@ class RealtimeDeflectionMeasurer:
         measurementYmm: Optional[float],
         targetPositionPx: Optional[float],
         targetPxPerMm: Optional[float],
+        targetOnlyPositionPx: Optional[float],
+        targetOnlyPxPerMm: Optional[float],
         timeSec: float,
         confidence: float,
         detectionStatus: str,
         homographyResult: HomographyResult,
         isLowQuality: bool,
+        measurementMethod: str,
+        targetOnlyReason: Optional[str],
+        staticAxisSource: str,
     ) -> DeflectionState:
         if self.estimator is None:
             return DeflectionState(
@@ -214,18 +279,31 @@ class RealtimeDeflectionMeasurer:
 
         statusHint = detectionStatus
         if self.config.measurementMethod in ("target-local-scale", "homography"):
-            if homographyResult.homography is None:
+            if measurementMethod == "target-only-image-y":
+                statusHint = f"target-only-{targetOnlyReason or 'static-unavailable'}"
+            elif measurementMethod == "target-local-scale" and staticAxisSource == "pose" and isLowQuality:
+                statusHint = "static-pose-low-quality"
+            elif measurementMethod == "target-local-scale" and staticAxisSource == "pose":
+                statusHint = "static-pose"
+            elif measurementMethod == "target-local-scale" and staticAxisSource == "homography" and isLowQuality:
+                statusHint = "static-homography-low-quality"
+            elif homographyResult.homography is None:
                 statusHint = "no-static-markers"
             elif isLowQuality:
                 statusHint = "low-homography-quality"
 
         if isinstance(self.estimator, PixelScaleDeflectionEstimator) and self.config.measurementMethod == "target-local-scale":
-            return self.estimator.updatePixelScale(
-                positionPx=targetPositionPx,
-                pxPerMm=targetPxPerMm,
+            return self.estimator.updatePixelScaleWithFallback(
+                references={
+                    "static": (targetPositionPx if measurementMethod == "target-local-scale" else None, targetPxPerMm if measurementMethod == "target-local-scale" else None),
+                    "image": (targetOnlyPositionPx, targetOnlyPxPerMm),
+                },
+                preferredKey="static",
+                fallbackKey="image",
                 timeSec=timeSec,
                 confidence=confidence,
                 statusHint=statusHint,
+                fallbackStatusHint=f"target-only-{targetOnlyReason or 'static-unavailable'}",
             )
 
         return self.estimator.update(

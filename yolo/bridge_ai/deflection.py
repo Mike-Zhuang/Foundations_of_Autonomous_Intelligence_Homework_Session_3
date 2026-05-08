@@ -165,6 +165,9 @@ class PixelScaleDeflectionEstimator(DeflectionEstimator):
         self.scaleSamples: list[float] = []
         self.baselinePixel: Optional[float] = None
         self.baselinePxPerMm: Optional[float] = None
+        self.referencePixelSamples: dict[str, list[float]] = {}
+        self.referenceScaleSamples: dict[str, list[float]] = {}
+        self.referenceBaselines: dict[str, tuple[float, float]] = {}
 
     def updatePixelScale(
         self,
@@ -232,4 +235,103 @@ class PixelScaleDeflectionEstimator(DeflectionEstimator):
             status=f"tracking:{statusHint}",
             measurementPositionPx=float(positionPx),
             measurementPxPerMm=float(pxPerMm),
+        )
+
+    def updatePixelScaleWithFallback(
+        self,
+        references: dict[str, tuple[Optional[float], Optional[float]]],
+        preferredKey: str,
+        fallbackKey: str,
+        timeSec: float,
+        confidence: float,
+        statusHint: str,
+        fallbackStatusHint: str,
+    ) -> DeflectionState:
+        validReferences = {
+            key: (float(positionPx), float(pxPerMm))
+            for key, (positionPx, pxPerMm) in references.items()
+            if positionPx is not None and pxPerMm is not None and pxPerMm > 1e-6
+        }
+        if not validReferences:
+            return DeflectionState(
+                timeSec=timeSec,
+                rawMm=None,
+                unscaledRawMm=None,
+                filteredMm=None,
+                baselineMm=self.baselineMm,
+                deflectionCm=None,
+                confidence=confidence,
+                status=f"missing:{statusHint}",
+            )
+
+        completionKey = fallbackKey if fallbackKey in validReferences or fallbackKey in self.referenceBaselines else preferredKey
+        if completionKey not in self.referenceBaselines:
+            for key, (positionPx, pxPerMm) in validReferences.items():
+                self.referencePixelSamples.setdefault(key, []).append(positionPx)
+                self.referenceScaleSamples.setdefault(key, []).append(pxPerMm)
+                if len(self.referencePixelSamples[key]) >= self.baselineFrames:
+                    baselinePixel = float(median(self.referencePixelSamples[key]))
+                    baselinePxPerMm = float(median(self.referenceScaleSamples[key]))
+                    self.referenceBaselines[key] = (baselinePixel, baselinePxPerMm)
+
+            if completionKey in self.referenceBaselines:
+                baselinePixel, baselinePxPerMm = self.referenceBaselines[completionKey]
+                self.baselinePixel = baselinePixel
+                self.baselinePxPerMm = baselinePxPerMm
+                self.baselineMm = baselinePixel / baselinePxPerMm
+
+            firstPosition, firstScale = next(iter(validReferences.values()))
+            return DeflectionState(
+                timeSec=timeSec,
+                rawMm=0.0,
+                unscaledRawMm=0.0,
+                filteredMm=0.0,
+                baselineMm=self.baselineMm,
+                deflectionCm=0.0,
+                confidence=confidence,
+                status="calibrating-baseline",
+                measurementPositionPx=firstPosition,
+                measurementPxPerMm=firstScale,
+            )
+
+        selectedKey = preferredKey
+        if selectedKey not in validReferences or selectedKey not in self.referenceBaselines:
+            selectedKey = fallbackKey
+        if selectedKey not in validReferences or selectedKey not in self.referenceBaselines:
+            return DeflectionState(
+                timeSec=timeSec,
+                rawMm=None,
+                unscaledRawMm=None,
+                filteredMm=None,
+                baselineMm=self.baselineMm,
+                deflectionCm=None,
+                confidence=confidence,
+                status=f"missing:{statusHint}",
+            )
+
+        positionPx, pxPerMm = validReferences[selectedKey]
+        baselinePixel, baselinePxPerMm = self.referenceBaselines[selectedKey]
+        if self.localScaleMode == "current":
+            scalePxPerMm = pxPerMm
+        elif self.localScaleMode == "average":
+            scalePxPerMm = float((pxPerMm + baselinePxPerMm) * 0.5)
+        else:
+            scalePxPerMm = baselinePxPerMm
+
+        unscaledRawMm = float((positionPx - baselinePixel) / scalePxPerMm)
+        rawMm = float(unscaledRawMm * self.deflectionScale)
+        filteredMm = self._filterRawMm(rawMm)
+        selectedStatus = statusHint if selectedKey == preferredKey else fallbackStatusHint
+
+        return DeflectionState(
+            timeSec=timeSec,
+            rawMm=rawMm,
+            unscaledRawMm=unscaledRawMm,
+            filteredMm=filteredMm,
+            baselineMm=self.baselineMm,
+            deflectionCm=filteredMm / 10.0,
+            confidence=confidence,
+            status=f"tracking:{selectedStatus}",
+            measurementPositionPx=positionPx,
+            measurementPxPerMm=pxPerMm,
         )

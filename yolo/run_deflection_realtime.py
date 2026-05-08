@@ -21,6 +21,8 @@ from bridge_ai.geometry import (
     estimateMarkerPoseTvec,
     estimateStaticBoardPose,
     estimateStaticPixelAxis,
+    estimateStaticPoseInfo,
+    estimateStaticPosePixelAxis,
     estimateTargetLocalCoordinateY,
 )
 from bridge_ai.io_utils import CsvWriter, createVideoWriter, openVideoSource
@@ -62,9 +64,22 @@ def parseArgs() -> argparse.Namespace:
         default="target-local-scale",
     )
     parser.add_argument("--target-marker-size", type=float, default=50.0, help="ID42 目标标记边长，单位 mm")
-    parser.add_argument("--min-used-points", type=int, default=16)
-    parser.add_argument("--max-rmse", type=float, default=2.6)
-    parser.add_argument("--min-inlier-ratio", type=float, default=0.65)
+    parser.add_argument("--min-used-points", type=int, default=12)
+    parser.add_argument("--max-rmse", type=float, default=4.0)
+    parser.add_argument("--min-inlier-ratio", type=float, default=0.45)
+    parser.add_argument(
+        "--target-only-fallback",
+        choices=["true", "false"],
+        default="true",
+        help="静态点不可用时，是否降级为仅用 ID42 + 图像竖直方向继续输出数据",
+    )
+    parser.add_argument(
+        "--static-pose-correction",
+        choices=["true", "false"],
+        default="true",
+        help="有相机标定时，是否用静态标 PnP 姿态修正测量方向",
+    )
+    parser.add_argument("--static-assist-min-points", type=int, default=4, help="静态姿态辅助所需最少角点数，4 表示 1 个静态标即可辅助")
     return parser.parse_args()
 
 
@@ -84,6 +99,8 @@ def printRealtimeGuide(args: argparse.Namespace) -> None:
     print(f"测量方法: {args.measurement_method}", flush=True)
     print(f"滤波档位: {args.filter_profile} (deadband={args.deadband_mm}mm, window={args.smooth_window})", flush=True)
     print(f"局部比例尺模式: {args.local_scale_mode}", flush=True)
+    print(f"静态点缺失降级: {args.target_only_fallback}", flush=True)
+    print(f"静态姿态辅助: {args.static_pose_correction} (min-points={args.static_assist_min_points})", flush=True)
     print(f"挠度比例修正: {args.deflection_scale}", flush=True)
     print("建议操作顺序:", flush=True)
     print("1) 若首次实验或机位变化，使用 --calibration-mode recalibrate", flush=True)
@@ -99,11 +116,16 @@ def localizeStatus(status: str) -> str:
         return "waiting-start"
     if status == "calibrating-baseline":
         return "calibrating-baseline"
+    if status.startswith("tracking:target-only-"):
+        return status.replace("tracking:", "tracking-warning:")
     if status.startswith("tracking:"):
         key = status.split(":", 1)[1]
         mapping = {
             "yolo": "tracking-yolo",
             "fallback-aruco": "tracking-aruco",
+            "static-pose": "tracking-static-pose",
+            "static-pose-low-quality": "tracking-static-pose-warning",
+            "static-homography-low-quality": "tracking-static-h-warning",
         }
         return mapping.get(key, key)
     if status.startswith("missing:"):
@@ -276,24 +298,47 @@ def main() -> int:
             worldPoint = None
             poseTvec = None
             staticBoardPose = None
+            staticPoseInfo = None
+            staticAxisSource = "none"
             compensatedWorldPoint = None
             targetPositionPx = None
             targetPxPerMm = None
+            targetOnlyPositionPx = None
+            targetOnlyPxPerMm = None
             measurementYmm = None
             measurementMethod = "none"
+            targetOnlyReason = None
             if homographyResult.homography is not None and detection.centerPixel is not None and not isLowQuality:
                 worldPoint = solver.pixelToWorld(homographyResult.homography, detection.centerPixel)
 
-            if calibration is not None and homographyResult.usedPointCount >= args.min_used_points and not isLowQuality:
+            if (
+                args.static_pose_correction == "true"
+                and calibration is not None
+                and homographyResult.usedPointCount >= args.static_assist_min_points
+            ):
+                staticPoseInfo = estimateStaticPoseInfo(
+                    homographyResult,
+                    calibration.cameraMatrix,
+                    minPointCount=args.static_assist_min_points,
+                )
+                if staticPoseInfo is not None:
+                    staticBoardPose = (staticPoseInfo.rvec, staticPoseInfo.tvec)
+            elif calibration is not None and homographyResult.usedPointCount >= args.min_used_points and not isLowQuality:
                 staticBoardPose = estimateStaticBoardPose(homographyResult, calibration.cameraMatrix)
 
             if (
                 args.measurement_method == "target-local-scale"
-                and homographyResult.homography is not None
                 and detection.markerCorners is not None
-                and not isLowQuality
             ):
-                staticPixelAxis = estimateStaticPixelAxis(homographyResult.homography)
+                staticPixelAxis = None
+                if staticPoseInfo is not None and calibration is not None:
+                    staticPixelAxis = estimateStaticPosePixelAxis(staticPoseInfo, calibration.cameraMatrix)
+                    if staticPixelAxis is not None:
+                        staticAxisSource = "pose"
+                if staticPixelAxis is None and homographyResult.homography is not None:
+                    staticPixelAxis = estimateStaticPixelAxis(homographyResult.homography)
+                    if staticPixelAxis is not None:
+                        staticAxisSource = "homography"
                 if staticPixelAxis is not None:
                     originPixel, axisUnit = staticPixelAxis
                     localScaleResult = estimateTargetLocalCoordinateY(
@@ -305,6 +350,42 @@ def main() -> int:
                     if localScaleResult is not None:
                         targetPositionPx, targetPxPerMm = localScaleResult
                         measurementMethod = "target-local-scale"
+
+            if (
+                args.measurement_method == "target-local-scale"
+                and targetPositionPx is None
+                and args.target_only_fallback == "true"
+                and detection.markerCorners is not None
+            ):
+                localScaleResult = estimateTargetLocalCoordinateY(
+                    markerCorners=detection.markerCorners,
+                    markerSizeMm=args.target_marker_size,
+                    originPixel=(0.0, 0.0),
+                    axisUnit=(0.0, 1.0),
+                )
+                if localScaleResult is not None:
+                    targetOnlyPositionPx, targetOnlyPxPerMm = localScaleResult
+                    targetPositionPx, targetPxPerMm = localScaleResult
+                    measurementMethod = "target-only-image-y"
+                    if homographyResult.homography is None:
+                        targetOnlyReason = "no-static-markers"
+                    elif isLowQuality:
+                        targetOnlyReason = "low-homography-quality"
+                    else:
+                        targetOnlyReason = "static-axis-unavailable"
+            elif (
+                args.measurement_method == "target-local-scale"
+                and args.target_only_fallback == "true"
+                and detection.markerCorners is not None
+            ):
+                localScaleResult = estimateTargetLocalCoordinateY(
+                    markerCorners=detection.markerCorners,
+                    markerSizeMm=args.target_marker_size,
+                    originPixel=(0.0, 0.0),
+                    axisUnit=(0.0, 1.0),
+                )
+                if localScaleResult is not None:
+                    targetOnlyPositionPx, targetOnlyPxPerMm = localScaleResult
 
             if (
                 args.measurement_method in ("static-compensated-pnp", "target-pnp")
@@ -325,7 +406,7 @@ def main() -> int:
                         measurementYmm = poseTvec[1]
                         measurementMethod = "target-pnp"
 
-            if measurementYmm is None and worldPoint is not None:
+            if measurementYmm is None and worldPoint is not None and measurementMethod == "none":
                 measurementYmm = worldPoint[1]
                 measurementMethod = "homography"
 
@@ -336,18 +417,34 @@ def main() -> int:
                 elapsed = time.time() - startTime
                 statusHint = detection.status
                 if args.measurement_method in ("target-local-scale", "homography"):
-                    if homographyResult.homography is None:
+                    if measurementMethod == "target-only-image-y":
+                        statusHint = f"target-only-{targetOnlyReason or 'static-unavailable'}"
+                    elif measurementMethod == "target-local-scale" and staticAxisSource == "pose" and isLowQuality:
+                        statusHint = "static-pose-low-quality"
+                    elif measurementMethod == "target-local-scale" and staticAxisSource == "pose":
+                        statusHint = "static-pose"
+                    elif measurementMethod == "target-local-scale" and staticAxisSource == "homography" and isLowQuality:
+                        statusHint = "static-homography-low-quality"
+                    elif homographyResult.homography is None:
                         statusHint = "no-static-markers"
                     elif isLowQuality:
                         statusHint = "low-homography-quality"
 
                 if isinstance(estimator, PixelScaleDeflectionEstimator) and args.measurement_method == "target-local-scale":
-                    state = estimator.updatePixelScale(
-                        positionPx=targetPositionPx,
-                        pxPerMm=targetPxPerMm,
+                    state = estimator.updatePixelScaleWithFallback(
+                        references={
+                            "static": (
+                                targetPositionPx if measurementMethod == "target-local-scale" else None,
+                                targetPxPerMm if measurementMethod == "target-local-scale" else None,
+                            ),
+                            "image": (targetOnlyPositionPx, targetOnlyPxPerMm),
+                        },
+                        preferredKey="static",
+                        fallbackKey="image",
                         timeSec=elapsed,
                         confidence=detection.confidence,
                         statusHint=statusHint,
+                        fallbackStatusHint=f"target-only-{targetOnlyReason or 'static-unavailable'}",
                     )
                 else:
                     state = estimator.update(
@@ -449,9 +546,16 @@ def main() -> int:
                     f"Used points: {homographyResult.usedPointCount}",
                     f"Reproj RMSE(px): {formatNumber(homographyResult.reprojectionRmsePx, 3)}",
                     f"Inlier ratio: {formatNumber(homographyResult.inlierRatio, 3)}",
+                    f"Static axis: {staticAxisSource}",
+                    f"Plane tilt(deg): {formatNumber(staticPoseInfo.planeTiltDeg if staticPoseInfo else None, 2)}",
+                    f"X tilt(deg): {formatNumber(staticPoseInfo.xTiltDeg if staticPoseInfo else None, 2)}",
+                    f"Y tilt(deg): {formatNumber(staticPoseInfo.yTiltDeg if staticPoseInfo else None, 2)}",
+                    f"Static roll(deg): {formatNumber(staticPoseInfo.rollDeg if staticPoseInfo else None, 2)}",
+                    f"Pose RMSE(px): {formatNumber(staticPoseInfo.reprojectionRmsePx if staticPoseInfo else None, 3)}",
                     f"Detect src: {localizeDetectionSource(detection.status)}",
                     f"Detect conf: {detection.confidence:.3f}",
                     f"Measure: {measurementMethod}",
+                    f"Static fallback: {targetOnlyReason}",
                     f"Filter: {args.filter_profile}",
                     f"Deadband(mm): {args.deadband_mm:.3f}",
                     f"Scale mode: {args.local_scale_mode}",

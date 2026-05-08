@@ -32,9 +32,9 @@ def parseArgs() -> argparse.Namespace:
     parser.add_argument("--overlay-level", choices=["minimal", "balanced", "debug"], default="debug")
     parser.add_argument("--calibration-mode", choices=["off", "use"], default="use")
     parser.add_argument("--calibration-file", default="yolo/artifacts/camera_calibration.npz")
-    parser.add_argument("--min-used-points", type=int, default=16)
-    parser.add_argument("--max-rmse", type=float, default=2.6)
-    parser.add_argument("--min-inlier-ratio", type=float, default=0.65)
+    parser.add_argument("--min-used-points", type=int, default=12)
+    parser.add_argument("--max-rmse", type=float, default=4.0)
+    parser.add_argument("--min-inlier-ratio", type=float, default=0.45)
     parser.add_argument(
         "--deflection-scale",
         type=float,

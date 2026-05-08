@@ -7,6 +7,8 @@ from typing import Optional, Tuple
 import cv2
 import numpy as np
 
+from bridge_ai.aruco_utils import buildPrecisionArucoDetectorParameters
+
 
 @dataclass
 class DetectionResult:
@@ -41,7 +43,7 @@ class MidpointTargetDetector:
                 self.yoloModel = None
 
         fallbackDict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_5X5_250)
-        fallbackParams = cv2.aruco.DetectorParameters()
+        fallbackParams = buildPrecisionArucoDetectorParameters()
         self.fallbackArucoDetector = cv2.aruco.ArucoDetector(fallbackDict, fallbackParams)
 
     def detect(self, frame: np.ndarray) -> DetectionResult:
