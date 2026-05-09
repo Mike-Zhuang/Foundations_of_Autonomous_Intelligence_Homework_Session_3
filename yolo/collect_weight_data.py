@@ -58,7 +58,8 @@ def parseArgs() -> argparse.Namespace:
     )
     parser.add_argument("--static-assist-min-points", type=int, default=4, help="静态姿态辅助所需最少角点数，4 表示 1 个静态标即可辅助")
     parser.add_argument("--capture-seconds", type=float, default=8.0)
-    parser.add_argument("--min-valid-frames", type=int, default=120)
+    parser.add_argument("--min-valid-frames", type=int, default=80)
+    parser.add_argument("--collection-smooth-window", type=int, default=5, help="每轮采集独立滑动滤波窗口帧数，不使用跨轮 deadband")
     parser.add_argument("--output-dir", default="yolo/results")
     return parser.parse_args()
 
@@ -88,7 +89,11 @@ def printGuide(args: argparse.Namespace) -> None:
     print("阶段 4：换下一个重量继续；输入 done 结束并保存数据。", flush=True)
     print("窗口按键：s 开始当前阶段，e 提前结束当前采集，q 中止。", flush=True)
     print(f"测量方法: {args.measurement_method}, local-scale-mode: {args.local_scale_mode}", flush=True)
-    print(f"最短采集时长: {args.capture_seconds}s, 最少有效帧: {args.min_valid_frames}", flush=True)
+    print(
+        f"最短采集时长: {args.capture_seconds}s, 最少有效帧: {args.min_valid_frames}, "
+        f"采集滑动滤波窗口: {args.collection_smooth_window}帧",
+        flush=True,
+    )
     print("================================================\n", flush=True)
 
 
@@ -207,6 +212,27 @@ def readStandardDeflectionMm() -> float:
             print("输入格式错误：请输入数字，单位 mm。", flush=True)
 
 
+def getMeasurementRawMm(measurement: MeasurementFrame) -> float | None:
+    rawMm = measurement.state.rawMm
+    if rawMm is None or not np.isfinite(rawMm):
+        return None
+    return float(rawMm)
+
+
+def updateCollectionFilter(rawMm: float | None, rawWindow: deque[float], windowSize: int) -> float | None:
+    if rawMm is None:
+        return None
+    rawWindow.append(float(rawMm))
+    while len(rawWindow) > max(1, windowSize):
+        rawWindow.popleft()
+    values = np.asarray(rawWindow, dtype=np.float64)
+    if values.size == 1:
+        return float(values[0])
+    medianValue = float(np.median(values))
+    meanValue = float(np.mean(values))
+    return float(0.7 * medianValue + 0.3 * meanValue)
+
+
 def writeCsv(path: Path, rows: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if not rows:
@@ -252,6 +278,7 @@ def buildRawRow(
     weightG: float,
     measurement: MeasurementFrame,
     isCollecting: bool,
+    collectionFilteredMm: float | None = None,
     standardDeflectionMm: float | None = None,
 ) -> dict:
     stateDict = asdict(measurement.state)
@@ -260,6 +287,7 @@ def buildRawRow(
         "weightG": weightG,
         "standardDeflectionMm": standardDeflectionMm,
         "collecting": int(isCollecting),
+        "collectionFilteredMm": collectionFilteredMm,
         "measurementMethod": measurement.measurementMethod,
         "detectStatus": measurement.detection.status,
         "usedPointCount": measurement.homographyResult.usedPointCount,
@@ -335,6 +363,8 @@ def main() -> int:
             startTime: float | None = None
             lastTime = time.time()
             historyMm: deque[float] = deque(maxlen=180)
+            previewRawWindow: deque[float] = deque(maxlen=max(1, args.collection_smooth_window))
+            collectionRawWindow: deque[float] = deque(maxlen=max(1, args.collection_smooth_window))
             waitingForValidNoticePrinted = False
 
             while True:
@@ -345,15 +375,27 @@ def main() -> int:
                 measurement = measurer.process(frame, dtSec=min(now - lastTime, 1.0 / max(fps, 1.0)))
                 lastTime = now
 
-                isValid = measurement.state.filteredMm is not None and measurement.state.status.startswith("tracking")
-                if measurement.state.filteredMm is not None:
-                    historyMm.append(float(measurement.state.filteredMm))
+                rawMm = getMeasurementRawMm(measurement)
+                previewFilteredMm = updateCollectionFilter(rawMm, previewRawWindow, args.collection_smooth_window)
+                collectionFilteredMm: float | None = None
+                isTracking = measurement.state.status.startswith("tracking")
+                isValid = False
                 if collecting:
-                    sampleRawRows.append(buildRawRow(sampleId, weightG, measurement, isCollecting=True))
+                    collectionFilteredMm = updateCollectionFilter(rawMm, collectionRawWindow, args.collection_smooth_window)
+                    isValid = collectionFilteredMm is not None and isTracking
+                    sampleRawRows.append(
+                        buildRawRow(
+                            sampleId,
+                            weightG,
+                            measurement,
+                            isCollecting=True,
+                            collectionFilteredMm=collectionFilteredMm,
+                        )
+                    )
                     sampleFrames.append(
                         WeightSampleFrame(
                             timeSec=0.0 if startTime is None else now - startTime,
-                            deflectionMm=float(measurement.state.filteredMm) if measurement.state.filteredMm is not None else float("nan"),
+                            deflectionMm=collectionFilteredMm if collectionFilteredMm is not None else float("nan"),
                             confidence=float(measurement.detection.confidence),
                             quality=computeQuality(
                                 measurement.homographyResult.reprojectionRmsePx,
@@ -365,6 +407,10 @@ def main() -> int:
                     )
                     if isValid:
                         validFrames += 1
+                    if collectionFilteredMm is not None:
+                        historyMm.append(float(collectionFilteredMm))
+                elif previewFilteredMm is not None:
+                    historyMm.append(float(previewFilteredMm))
 
                 elapsed = 0.0 if startTime is None else now - startTime
                 enoughTime = elapsed >= args.capture_seconds
@@ -374,6 +420,8 @@ def main() -> int:
                     f"Collecting: {'YES' if collecting else 'NO'}",
                     f"Valid: {validFrames}/{args.min_valid_frames}",
                     f"Elapsed(s): {elapsed:.1f}/{args.capture_seconds:.1f}+",
+                    f"Window(mm): {collectionFilteredMm if collecting else previewFilteredMm}",
+                    f"Window filter: {args.collection_smooth_window} frames, per-round reset",
                     "Wait stable green curve, then press S",
                     "Keys: S start, E finish-if-ready, Q abort",
                 ]
@@ -386,9 +434,10 @@ def main() -> int:
                     startTime = time.time()
                     sampleFrames.clear()
                     sampleRawRows.clear()
+                    collectionRawWindow.clear()
                     validFrames = 0
                     waitingForValidNoticePrinted = False
-                    print("开始采集当前重量...", flush=True)
+                    print("开始采集当前重量。本轮采集滑动滤波器已清空。", flush=True)
                 if key == ord("e") and collecting:
                     if enoughValid:
                         print("手动结束当前采集。", flush=True)

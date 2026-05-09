@@ -1,41 +1,50 @@
+# macOS / editor noise
 .DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Python cache / build output
 __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
 
-yolo/results/
-yolo/artifacts/
+# Local environments
+.venv/
+venv/
+env/
+.env
+.env.*
 
-# local Word files
-标定点.docx
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+
+# Large raw media generated during experiments.
+# CSV / JSON / small model bundles under yolo/results are intentionally tracked.
+*.mp4
+*.mov
+*.avi
+*.mkv
+
+# Downloaded foundation / detector weights should be fetched locally.
+# Keep yolo/results/bridge_models_final/model_bundle.pth trackable.
+yolov8*.pt
+*.onnx
+*.engine
+
+# Office lock files and local exported documents.
 ~$*.docx
-*.docx
-
-# local Excel files
 ~$*.xlsx
-*.xlsx
-
-# local PPT files
 ~$*.pptx
-*.pptx
-
-# local PDF files
-~$*.pdf
+*.docx
 *.pdf
-
-# local image files
-~$*.jpg
-~$*.jpeg
-~$*.png
-~$*.gif
-~$*.bmp
-~$*.tiff
-~$*.tif
-~$*.psd
-~$*.raw
-~$*.webp
-~$*.svg
-~$*.ai
-~$*.eps
-~$*.ico

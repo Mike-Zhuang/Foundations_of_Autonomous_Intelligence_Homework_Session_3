@@ -1,0 +1,9 @@
+打印参数（必须 100% 原始比例，不可缩放）:
+- 静态标记字典: DICT_5X5_250
+- 静态标记ID: 10, 11, 12, 13, 14
+- 静态标记边长: 40 mm
+- 生成方式: 每个静态标记独立文件，按需单独打印
+- 命名规则: static_marker_id{ID}_{SIZE}mm.png
+- 跨中回退标记: ArUco ID 42（可选）
+- 跨中主目标建议: midpoint_circle_marker_50mm.png 中央圆点（直径约12mm）
+- ChArUco 标定板: 5x7, square=24mm, marker=18mm

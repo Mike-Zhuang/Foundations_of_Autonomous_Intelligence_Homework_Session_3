@@ -136,6 +136,138 @@ def trainRidgeCandidate(
     }
 
 
+def isotonicIncreasing(y: np.ndarray) -> np.ndarray:
+    values = [float(value) for value in y.tolist()]
+    weights = [1.0 for _ in values]
+    starts = list(range(len(values)))
+    ends = list(range(len(values)))
+    index = 0
+    while index < len(values) - 1:
+        if values[index] <= values[index + 1]:
+            index += 1
+            continue
+        totalWeight = weights[index] + weights[index + 1]
+        mergedValue = (values[index] * weights[index] + values[index + 1] * weights[index + 1]) / totalWeight
+        values[index] = mergedValue
+        weights[index] = totalWeight
+        ends[index] = ends[index + 1]
+        del values[index + 1]
+        del weights[index + 1]
+        del starts[index + 1]
+        del ends[index + 1]
+        if index > 0:
+            index -= 1
+
+    fitted = np.zeros(len(y), dtype=np.float64)
+    for value, start, end in zip(values, starts, ends):
+        fitted[start : end + 1] = value
+    return fitted
+
+
+def aggregateSortedPoints(x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    order = np.argsort(x)
+    xSorted = np.asarray(x[order], dtype=np.float64)
+    ySorted = np.asarray(y[order], dtype=np.float64)
+    uniqueX: list[float] = []
+    avgY: list[float] = []
+    index = 0
+    while index < len(xSorted):
+        currentX = float(xSorted[index])
+        same = np.isclose(xSorted, currentX, rtol=0.0, atol=1e-9)
+        same[:index] = False
+        sameIndices = np.where(same)[0]
+        uniqueX.append(currentX)
+        avgY.append(float(np.mean(ySorted[sameIndices])))
+        index = int(sameIndices[-1]) + 1
+    return np.asarray(uniqueX, dtype=np.float64), np.asarray(avgY, dtype=np.float64)
+
+
+def smoothMonotonicAnchors(y: np.ndarray, passes: int = 2) -> np.ndarray:
+    smoothed = np.asarray(y, dtype=np.float64).copy()
+    if len(smoothed) < 3:
+        return smoothed
+    for _ in range(passes):
+        current = smoothed.copy()
+        current[0] = 0.75 * smoothed[0] + 0.25 * smoothed[1]
+        current[-1] = 0.75 * smoothed[-1] + 0.25 * smoothed[-2]
+        current[1:-1] = 0.25 * smoothed[:-2] + 0.5 * smoothed[1:-1] + 0.25 * smoothed[2:]
+        smoothed = np.maximum.accumulate(current)
+    return smoothed
+
+
+def fitMonotonicPiecewise(x: np.ndarray, y: np.ndarray, smoothingPasses: int = 2) -> dict:
+    anchorsX, rawY = aggregateSortedPoints(np.asarray(x, dtype=np.float64), np.asarray(y, dtype=np.float64))
+    anchorsY = smoothMonotonicAnchors(isotonicIncreasing(rawY), passes=smoothingPasses)
+    return {"anchorsX": anchorsX.tolist(), "anchorsY": anchorsY.tolist(), "smoothingPasses": smoothingPasses}
+
+
+def predictMonotonicAnchors(model: dict, xValue: float) -> float:
+    anchorsX = np.asarray(model["anchorsX"], dtype=np.float64)
+    anchorsY = np.asarray(model["anchorsY"], dtype=np.float64)
+    if len(anchorsX) == 1:
+        return float(anchorsY[0])
+    if xValue < anchorsX[0]:
+        denom = max(float(anchorsX[1] - anchorsX[0]), 1e-9)
+        slope = float(anchorsY[1] - anchorsY[0]) / denom
+        return float(anchorsY[0] + slope * (xValue - anchorsX[0]))
+    if xValue > anchorsX[-1]:
+        denom = max(float(anchorsX[-1] - anchorsX[-2]), 1e-9)
+        slope = float(anchorsY[-1] - anchorsY[-2]) / denom
+        return float(anchorsY[-1] + slope * (xValue - anchorsX[-1]))
+    return float(np.interp(xValue, anchorsX, anchorsY))
+
+
+def trainMonotonicPiecewiseCandidate(
+    rows: list[dict],
+    x: np.ndarray,
+    y: np.ndarray,
+    unit: str,
+    inputName: str,
+    modelType: str,
+) -> dict:
+    x1d = np.asarray(x, dtype=np.float64).reshape(-1)
+    looPred: list[float] = []
+    for holdout in range(len(rows)):
+        trainMask = np.ones(len(rows), dtype=bool)
+        trainMask[holdout] = False
+        model = fitMonotonicPiecewise(x1d[trainMask], y[trainMask])
+        looPred.append(predictMonotonicAnchors(model, float(x1d[holdout])))
+    predArr = np.asarray(looPred, dtype=np.float64)
+    fullModel = fitMonotonicPiecewise(x1d, y)
+    return {
+        "modelType": modelType,
+        "inputName": inputName,
+        "anchorsX": fullModel["anchorsX"],
+        "anchorsY": fullModel["anchorsY"],
+        "metrics": regressionMetrics(predArr, y, unit),
+        "perSample": perSample(rows, y, predArr, unit),
+    }
+
+
+def trainChainedMonotonicWeightCandidate(rows: list[dict]) -> dict:
+    phoneMm = targetArray(rows, "deflectionMeanMm")
+    standardMm = targetArray(rows, "standardDeflectionMm")
+    weightG = targetArray(rows, "weightG")
+    looPred: list[float] = []
+    for holdout in range(len(rows)):
+        trainMask = np.ones(len(rows), dtype=bool)
+        trainMask[holdout] = False
+        phoneToStandard = fitMonotonicPiecewise(phoneMm[trainMask], standardMm[trainMask])
+        standardToWeight = fitMonotonicPiecewise(standardMm[trainMask], weightG[trainMask])
+        predictedStandard = predictMonotonicAnchors(phoneToStandard, float(phoneMm[holdout]))
+        looPred.append(predictMonotonicAnchors(standardToWeight, predictedStandard))
+    predArr = np.asarray(looPred, dtype=np.float64)
+    return {
+        "modelType": "chained_monotonic",
+        "chain": "deflectionMeanMm -> standardDeflectionMm -> weightG",
+        "phoneToStandard": fitMonotonicPiecewise(phoneMm, standardMm),
+        "standardToWeight": fitMonotonicPiecewise(standardMm, weightG),
+        "weightsG": sorted({float(value) for value in weightG.tolist()}),
+        "metrics": regressionMetrics(predArr, weightG, "G"),
+        "perSample": perSample(rows, weightG, predArr, "G"),
+    }
+
+
 def perSample(rows: list[dict], truth: np.ndarray, pred: np.ndarray, unit: str) -> list[dict]:
     return [
         {
@@ -377,8 +509,18 @@ def trainWeightMlpCandidate(
     }
 
 
+def candidateSelectionScore(candidate: dict, unit: str) -> float:
+    metrics = candidate["metrics"]
+    mae = float(metrics[f"mae{unit}"])
+    rmse = float(metrics[f"rmse{unit}"])
+    maxAbs = float(metrics[f"maxAbsError{unit}"])
+    score = mae + 0.25 * rmse + 0.10 * maxAbs
+    metrics["selectionScore"] = score
+    return score
+
+
 def selectCandidate(candidates: list[dict], unit: str) -> dict:
-    candidates.sort(key=lambda item: (item["metrics"][f"mae{unit}"], item["metrics"][f"rmse{unit}"]))
+    candidates.sort(key=lambda item: (candidateSelectionScore(item, unit), item["metrics"][f"mae{unit}"]))
     return candidates[0]
 
 
@@ -393,8 +535,18 @@ def trainWeightFromPhone(
     y = targetArray(rows, "weightG")
     ridge = trainRidgeCandidate(rows, x, y, "G", FEATURE_NAMES)
     ridge["weightsG"] = sorted({float(value) for value in y.tolist()})
+    monotonic = trainMonotonicPiecewiseCandidate(
+        rows,
+        targetArray(rows, "deflectionMeanMm"),
+        y,
+        "G",
+        "deflectionMeanMm",
+        "monotonic_phone_weight",
+    )
+    monotonic["weightsG"] = ridge["weightsG"]
+    chained = trainChainedMonotonicWeightCandidate(rows)
     mlp = trainWeightMlpCandidate(rows, x, y, epochs, lr, weightDecay, progressCallback)
-    candidates = [ridge] + ([mlp] if mlp is not None else [])
+    candidates = [ridge, monotonic, chained] + ([mlp] if mlp is not None else [])
     recommended = selectCandidate(candidates, "G")
     return {"taskName": "weight_from_phone", "target": "weightG", "recommended": recommended["modelType"], "candidates": candidates}
 
@@ -409,6 +561,14 @@ def trainDeflectionFromWeight(
     x = weightFeatureMatrixFromRows(rows)
     y = targetArray(rows, "standardDeflectionMm")
     ridge = trainRidgeCandidate(rows, x, y, "Mm", WEIGHT_FEATURE_NAMES)
+    monotonic = trainMonotonicPiecewiseCandidate(
+        rows,
+        targetArray(rows, "weightG"),
+        y,
+        "Mm",
+        "weightG",
+        "monotonic_weight_deflection",
+    )
     mlp = trainRegressionMlpCandidate(
         rows,
         x,
@@ -421,7 +581,7 @@ def trainDeflectionFromWeight(
         "deflection_from_weight",
         progressCallback,
     )
-    candidates = [ridge] + ([mlp] if mlp is not None else [])
+    candidates = [ridge, monotonic] + ([mlp] if mlp is not None else [])
     recommended = selectCandidate(candidates, "Mm")
     return {"taskName": "deflection_from_weight", "target": "standardDeflectionMm", "recommended": recommended["modelType"], "candidates": candidates}
 
@@ -436,6 +596,14 @@ def trainLaserFromPhone(
     x = phoneFeatureMatrix(rows)
     y = targetArray(rows, "standardDeflectionMm")
     ridge = trainRidgeCandidate(rows, x, y, "Mm", FEATURE_NAMES)
+    monotonic = trainMonotonicPiecewiseCandidate(
+        rows,
+        targetArray(rows, "deflectionMeanMm"),
+        y,
+        "Mm",
+        "deflectionMeanMm",
+        "monotonic_phone_deflection",
+    )
     mlp = trainRegressionMlpCandidate(
         rows,
         x,
@@ -448,7 +616,7 @@ def trainLaserFromPhone(
         "laser_from_phone",
         progressCallback,
     )
-    candidates = [ridge] + ([mlp] if mlp is not None else [])
+    candidates = [ridge, monotonic] + ([mlp] if mlp is not None else [])
     recommended = selectCandidate(candidates, "Mm")
     return {"taskName": "laser_from_phone", "target": "standardDeflectionMm", "recommended": recommended["modelType"], "candidates": candidates}
 
@@ -633,12 +801,24 @@ def predictWeightMlp(candidate: dict, features: np.ndarray) -> tuple[float, list
         return predG, [float(value) for value in probs]
 
 
+def predictChainedMonotonicWeight(candidate: dict, featureRow: dict) -> float:
+    phoneMm = float(featureRow["deflectionMeanMm"])
+    predictedStandard = predictMonotonicAnchors(candidate["phoneToStandard"], phoneMm)
+    return predictMonotonicAnchors(candidate["standardToWeight"], predictedStandard)
+
+
 def predictWeightFromPhone(bundle: dict, featureRow: dict) -> dict:
     task = bundle["tasks"]["weight_from_phone"]
     candidate = recommendedCandidate(task)
     features = np.asarray([[float(featureRow[name]) for name in FEATURE_NAMES]], dtype=np.float64)
     if candidate["modelType"] == "mlp_weight":
         predG, probs = predictWeightMlp(candidate, features)
+    elif candidate["modelType"] == "monotonic_phone_weight":
+        predG = predictMonotonicAnchors(candidate, float(featureRow["deflectionMeanMm"]))
+        probs = []
+    elif candidate["modelType"] == "chained_monotonic":
+        predG = predictChainedMonotonicWeight(candidate, featureRow)
+        probs = []
     else:
         predG = predictRidge(candidate, features)
         probs = []
@@ -662,6 +842,8 @@ def predictStandardDeflectionFromWeight(bundle: dict, weightG: float) -> dict:
     features = weightFeatureMatrix(np.asarray([float(weightG)], dtype=np.float64))
     if candidate["modelType"] == "mlp_regression":
         predMm = predictRegressionMlp(candidate, features)
+    elif candidate["modelType"] == "monotonic_weight_deflection":
+        predMm = predictMonotonicAnchors(candidate, float(weightG))
     else:
         predMm = predictRidge(candidate, features)
     return {
@@ -678,6 +860,8 @@ def predictStandardDeflectionFromPhone(bundle: dict, featureRow: dict) -> dict:
     features = np.asarray([[float(featureRow[name]) for name in FEATURE_NAMES]], dtype=np.float64)
     if candidate["modelType"] == "mlp_regression":
         predMm = predictRegressionMlp(candidate, features)
+    elif candidate["modelType"] == "monotonic_phone_deflection":
+        predMm = predictMonotonicAnchors(candidate, float(featureRow["deflectionMeanMm"]))
     else:
         predMm = predictRidge(candidate, features)
     phoneMm = float(featureRow["deflectionMeanMm"])

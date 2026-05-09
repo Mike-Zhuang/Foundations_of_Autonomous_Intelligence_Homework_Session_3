@@ -1,0 +1,46 @@
+{
+  "dictionaryName": "DICT_5X5_250",
+  "markerSizeMm": 40.0,
+  "markers": [
+    {
+      "markerId": 10,
+      "topLeftMm": [
+        0.0,
+        0.0
+      ],
+      "sizeMm": 40.0
+    },
+    {
+      "markerId": 11,
+      "topLeftMm": [
+        60.0,
+        0.0
+      ],
+      "sizeMm": 40.0
+    },
+    {
+      "markerId": 12,
+      "topLeftMm": [
+        120.0,
+        0.0
+      ],
+      "sizeMm": 40.0
+    },
+    {
+      "markerId": 13,
+      "topLeftMm": [
+        30.0,
+        60.0
+      ],
+      "sizeMm": 40.0
+    },
+    {
+      "markerId": 14,
+      "topLeftMm": [
+        90.0,
+        60.0
+      ],
+      "sizeMm": 40.0
+    }
+  ]
+}

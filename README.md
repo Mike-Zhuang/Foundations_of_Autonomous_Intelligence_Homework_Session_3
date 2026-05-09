@@ -512,7 +512,8 @@ conda run --no-capture-output -n fai python yolo/collect_weight_data.py \
   --calibration-mode use \
   --calibration-file yolo/artifacts/camera_calibration.npz \
   --capture-seconds 8 \
-  --min-valid-frames 120 \
+  --min-valid-frames 80 \
+  --collection-smooth-window 5 \
   --overlay-level debug
 ```
 
@@ -549,6 +550,13 @@ conda run --no-capture-output -n fai python yolo/collect_weight_data.py \
 - `staticPlaneTiltDeg` / `staticRollDeg`：逐帧静态平面姿态诊断值，用来回看机位是否过斜。
 
 说明：`standardDeflectionMm` 会保存下来用于误差分析、赛后校准或后续改进拟合方法；当前重量模型默认仍然只用手机视觉挠度特征预测重量，避免比赛预测时依赖激光测距仪。
+
+采集滤波说明：
+
+- `collect_weight_data.py` 的训练特征不直接使用实时显示用的长状态滤波值，而是使用 `collectionFilteredMm`。
+- `collectionFilteredMm` 是每一轮按 `s` 后独立清空的 5 帧滑动滤波结果，默认由 `--collection-smooth-window 5` 控制。
+- 这个采集滤波没有跨轮 deadband，所以换小重量造成的零点几毫米变化不会被上一轮结果“粘住”。
+- `rawMm` 和实时 `filteredMm` 仍然会保存在逐帧 CSV 中，用于追溯；真正用于窗口特征训练的是本轮独立的 `collectionFilteredMm`。
 
 建议：
 
@@ -601,9 +609,11 @@ conda run -n fai python -m pip install rich
 
 训练逻辑：
 
-- 三个任务分别训练候选模型；每个任务都会同时训练小 MLP 和线性/二次/岭回归兜底模型。
+- 三个任务分别训练候选模型；每个任务都会同时训练小 MLP、线性/二次/岭回归，以及带物理先验的单调分段模型。
+- 任务 A 还会训练链式候选：`手机挠度 -> 激光标准挠度 -> 重量`，用于利用 Task C 的校正能力反推重量。
+- 单调分段模型会做轻微平滑，不把每个训练点当作必须命中的硬锚点，避免小数据下过拟合。
 - 数据很少，所以用留一验证（LOOCV）评估每个样本的预测误差。
-- 最终按 LOOCV MAE/RMSE 自动推荐模型；如果神经网络过拟合，脚本会推荐岭回归。
+- 最终按 `MAE + 0.25*RMSE + 0.10*MaxAbsError` 的稳健分数自动推荐模型；这样不会只为了平均误差好看而牺牲最坏情况。
 - 三个任务都会保留所有候选模型结果，不会只保存一个黑盒结果。
 
 为什么训练很快：
@@ -669,7 +679,7 @@ conda run --no-capture-output -n fai python yolo/predict_deflection_from_weight.
 
 - `Predicted standard deflection`：预测的激光标准挠度，单位 mm。
 - `Model`：任务名，固定为 `deflection_from_weight`。
-- `Recommended candidate`：当前模型包推荐使用的候选模型，例如 `ridge` 或 `mlp_regression`。
+- `Recommended candidate`：当前模型包推荐使用的候选模型，例如 `ridge`、`monotonic_weight_deflection` 或 `mlp_regression`。
 
 ## 11.5 任务 C：手机挠度校正为激光标准挠度
 
