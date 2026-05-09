@@ -2,7 +2,7 @@
   "timestamp": "20260509_230538",
   "rawCsv": "yolo/results/weight_raw_20260509_230538.csv",
   "windowsCsv": "yolo/results/weight_windows_20260509_230538.csv",
-  "sampleCount": 53,
+  "sampleCount": 52,
   "weightsG": [
     300.0,
     350.0,
@@ -15,7 +15,6 @@
     1750.7,
     1946.3,
     2122.3,
-    2223.8,
     2359.0,
     2501.4,
     2674.1,
