@@ -68,13 +68,14 @@ def printDatasetSummary(rows: list[dict], paths: list[Path], richTools: dict[str
     weights = [float(row["weightG"]) for row in rows]
     phone = [float(row["deflectionMeanMm"]) for row in rows]
     laser = [float(row["standardDeflectionMm"]) for row in rows]
+    sampleCount = len(rows)
     if richTools and richTools.get("available"):
         console = richTools["console"]
         table = richTools["Table"](title="三任务桥梁模型训练")
         table.add_column("项目", style="cyan", no_wrap=True)
         table.add_column("值", style="white")
         table.add_row("输入数据", "\n".join(str(path) for path in paths))
-        table.add_row("窗口样本数", str(len(rows)))
+        table.add_row("窗口样本数", str(sampleCount))
         table.add_row("重量范围", f"{min(weights):.1f}g ~ {max(weights):.1f}g")
         table.add_row("手机挠度范围", f"{min(phone):.3f}mm ~ {max(phone):.3f}mm")
         table.add_row("激光标准挠度范围", f"{min(laser):.3f}mm ~ {max(laser):.3f}mm")
@@ -82,20 +83,29 @@ def printDatasetSummary(rows: list[dict], paths: list[Path], richTools: dict[str
         table.add_row("任务 B", "重量 -> 激光标准挠度")
         table.add_row("任务 C", "手机视觉挠度 -> 激光标准挠度")
         console.print(table)
-        console.print(
-            richTools["Panel"](
-                "样本只有 27 个，所以训练很快是正常现象；关键看 LOOCV 指标，不看训练耗时长短。",
-                title="小数据提醒",
-                border_style="yellow",
+        if sampleCount <= 30:
+            console.print(
+                richTools["Panel"](
+                    f"当前只有 {sampleCount} 个窗口样本，所以训练很快是正常现象；关键看 LOOCV 指标，不看训练耗时长短。",
+                    title="小数据提醒",
+                    border_style="yellow",
+                )
             )
-        )
+        else:
+            console.print(
+                richTools["Panel"](
+                    f"当前共有 {sampleCount} 个窗口样本，训练速度仍会很快；建议重点查看 LOOCV 指标。",
+                    title="数据提醒",
+                    border_style="green",
+                )
+            )
         return
 
     print("\n================ 三任务桥梁模型训练 ================", flush=True)
     print("输入数据:", flush=True)
     for path in paths:
         print(f"- {path}", flush=True)
-    print(f"窗口样本数: {len(rows)}", flush=True)
+    print(f"窗口样本数: {sampleCount}", flush=True)
     print(f"重量范围: {min(weights):.1f}g ~ {max(weights):.1f}g", flush=True)
     print(f"手机挠度范围: {min(phone):.3f}mm ~ {max(phone):.3f}mm", flush=True)
     print(f"激光标准挠度范围: {min(laser):.3f}mm ~ {max(laser):.3f}mm", flush=True)
