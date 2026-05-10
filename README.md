@@ -29,7 +29,8 @@
 - yolo/train_weight_model.py：旧版单任务重量模型训练入口。
 - yolo/predict_weight_realtime.py：实时重量预测入口。
 - yolo/predict_deflection_from_weight.py：任务 B，给定重量预测激光标准挠度。
-- yolo/predict_standard_deflection_from_phone.py：任务 C，手机挠度校正为激光标准挠度。
+- yolo/predict_standard_deflection_realtime.py：任务 C，实时手机挠度校正为激光标准挠度。
+- yolo/predict_standard_deflection_from_phone.py：任务 C 离线复盘入口。
 - yolo/train_midpoint_yolo.py：旧兼容入口，仅提示迁移到三段式流程。
 - yolo/bridge_ai/config.py：静态标记布局定义与读写。
 - yolo/bridge_ai/aruco_utils.py：OpenCV ArUco 精度优先检测参数。
@@ -640,6 +641,7 @@ conda run --no-capture-output -n fai python yolo/predict_weight_realtime.py \
   --source 0 \
   --model-path yolo/results/bridge_models_final/model_bundle.pth \
   --task weight-from-phone \
+  --model-choice auto \
   --measurement-method target-local-scale \
   --local-scale-mode baseline \
   --target-only-fallback true \
@@ -647,6 +649,9 @@ conda run --no-capture-output -n fai python yolo/predict_weight_realtime.py \
   --static-assist-min-points 4 \
   --calibration-mode use \
   --calibration-file yolo/artifacts/camera_calibration.npz \
+  --live-window-frames 5 \
+  --weight-smooth-window 3 \
+  --min-valid-frames 80 \
   --overlay-level debug
 ```
 
@@ -654,7 +659,7 @@ conda run --no-capture-output -n fai python yolo/predict_weight_realtime.py \
 
 1. 启动后先保持空载，在视频窗口按 `s` 锁定基线。
 2. 放上未知重量，等待挠度读数和绿色曲线稳定。
-3. 窗口会连续显示实时重量估计，你可以观察稳定值。
+3. 窗口会连续显示实时重量估计，你可以观察稳定值；右侧 debug 面板从窗口一弹出就会显示。
 4. 想要最终输出时按 `s`，程序会采集一个稳定窗口并在命令行输出最终重量。
 5. 按 `q` 退出。
 
@@ -663,7 +668,11 @@ conda run --no-capture-output -n fai python yolo/predict_weight_realtime.py \
 - `Live weight(g)`：滚动窗口实时估计。
 - `Nearest(g)`：最接近训练过的重量档位。
 - `FINAL`：按 `s` 后稳定窗口的最终预测。
-- debug 面板会显示挠度标准差、漂移等稳定性信息。
+- debug 面板会显示挠度标准差、漂移、绿色挠度曲线和重量预测曲线。
+- 空载或接近 0 挠度时，程序会显示 `0g / no load`，不让模型在训练数据外推区间显示负重量。
+- `--live-window-frames 5` 控制实时预测反应速度；值越小越快，值越大越稳。
+- `--weight-smooth-window 3` 只对显示重量做轻量平滑，不改变底层挠度测量算法。
+- `--model-choice auto` 使用训练时留一验证选出的推荐候选；想手动比较时可改成 `monotonic`（单调函数逼近器）或 `mlp`（神经网络）。
 
 ## 11.4 任务 B：给定重量预测激光标准挠度
 
@@ -672,24 +681,55 @@ conda run --no-capture-output -n fai python yolo/predict_weight_realtime.py \
 ```bash
 conda run --no-capture-output -n fai python yolo/predict_deflection_from_weight.py \
   --model-path yolo/results/bridge_models_final/model_bundle.pth \
-  --weight-g 4300
+  --weight-g 4300 \
+  --model-choice auto
 ```
 
 输出含义：
 
 - `Predicted standard deflection`：预测的激光标准挠度，单位 mm。
 - `Model`：任务名，固定为 `deflection_from_weight`。
-- `Recommended candidate`：当前模型包推荐使用的候选模型，例如 `ridge`、`monotonic_weight_deflection` 或 `mlp_regression`。
+- `Used candidate`：当前实际使用的候选模型，例如 `monotonic_weight_deflection`、`ridge` 或 `mlp_regression`。
+- `--model-choice auto/mlp/monotonic/ridge`：手动选择候选模型；默认 `auto`。
 
 ## 11.5 任务 C：手机挠度校正为激光标准挠度
 
-如果现场同时有手机视觉和激光测距仪，或者需要比较两者误差，就用任务 C。它不会重新检测视频，只读取已有的窗口特征 CSV：
+任务 C 的含义是：手机和电脑脚本实时测出挠度后，模型把它校正/预测为“激光等效标准挠度”。这里显示的是我们的预测答案，不是老师隐藏的真实激光标准答案。比赛结束后，再把这个值和老师的激光标准答案对比。
+
+实时任务 C 推荐命令：
+
+```bash
+conda run --no-capture-output -n fai python yolo/predict_standard_deflection_realtime.py \
+  --source 0 \
+  --model-path yolo/results/bridge_models_final/model_bundle.pth \
+  --model-choice auto \
+  --measurement-method target-local-scale \
+  --local-scale-mode baseline \
+  --target-only-fallback true \
+  --static-pose-correction true \
+  --static-assist-min-points 4 \
+  --calibration-mode use \
+  --calibration-file yolo/artifacts/camera_calibration.npz \
+  --live-window-frames 5 \
+  --min-valid-frames 80 \
+  --overlay-level debug
+```
+
+窗口显示：
+
+- `Phone deflection(mm)`：手机视觉脚本测得的挠度。
+- `Pred standard(mm)`：模型预测的激光等效标准挠度，也就是我们提交/对比用的任务 C 答案。
+- `Phone-standard(mm)`：手机视觉挠度减去预测标准挠度，用来看手机测量偏差趋势。
+- 右侧 debug 面板会同时显示手机挠度曲线和预测标准挠度曲线。
+
+离线复盘仍然可以用旧脚本。它不会重新检测视频，只读取已有的窗口特征 CSV：
 
 ```bash
 conda run --no-capture-output -n fai python yolo/predict_standard_deflection_from_phone.py \
   --model-path yolo/results/bridge_models_final/model_bundle.pth \
   --windows-csv yolo/results/weight_windows_20260508_194555.csv \
-  --output-csv yolo/results/phone_laser_correction.csv
+  --output-csv yolo/results/phone_laser_correction.csv \
+  --model-choice auto
 ```
 
 输出含义：
@@ -706,7 +746,7 @@ conda run --no-capture-output -n fai python yolo/predict_standard_deflection_fro
 4. 用 `train_bridge_task_models.py` 训练三任务模型，检查 `metrics.json` 中三个任务的留一验证误差。
 5. 任务 A 用 `predict_weight_realtime.py`，先空载按 `s` 锁定基线，再放未知重量。
 6. 任务 B 用 `predict_deflection_from_weight.py`，直接输入重量预测标准挠度。
-7. 任务 C 用 `predict_standard_deflection_from_phone.py`，把手机视觉窗口数据校正到激光标准挠度。
+7. 任务 C 现场用 `predict_standard_deflection_realtime.py`，把手机实时挠度校正为我们的激光等效标准挠度答案；赛后可用离线脚本复盘 CSV。
 
 ## 12. 精度验收流程（建议按此提交实验结果）
 

@@ -724,6 +724,33 @@ def recommendedCandidate(taskPayload: dict) -> dict:
     return taskPayload["candidates"][0]
 
 
+def candidateMatchesPreference(candidate: dict, modelPreference: str) -> bool:
+    modelType = str(candidate.get("modelType", ""))
+    if modelPreference == "auto":
+        return False
+    if modelPreference == "mlp":
+        return modelType.startswith("mlp")
+    if modelPreference == "monotonic":
+        return "monotonic" in modelType and modelType != "chained_monotonic"
+    if modelPreference == "chained":
+        return modelType == "chained_monotonic"
+    if modelPreference == "ridge":
+        return modelType == "ridge"
+    return modelType == modelPreference
+
+
+def selectCandidateByPreference(taskPayload: dict, modelPreference: str = "auto") -> dict:
+    if modelPreference == "auto":
+        return recommendedCandidate(taskPayload)
+    for candidate in taskPayload["candidates"]:
+        if candidateMatchesPreference(candidate, modelPreference) and (
+            not str(candidate.get("modelType", "")).startswith("mlp") or "stateDict" in candidate
+        ):
+            return candidate
+    available = [str(candidate.get("modelType", "")) for candidate in taskPayload["candidates"]]
+    raise ValueError(f"任务 {taskPayload.get('taskName', '')} 没有可用候选模型: {modelPreference}。可用: {available}")
+
+
 def predictRidge(candidate: dict, features: np.ndarray) -> float:
     design = polynomialDesign(features, int(candidate["degree"]))
     return float((design @ np.asarray(candidate["coef"], dtype=np.float64))[0])
@@ -807,9 +834,9 @@ def predictChainedMonotonicWeight(candidate: dict, featureRow: dict) -> float:
     return predictMonotonicAnchors(candidate["standardToWeight"], predictedStandard)
 
 
-def predictWeightFromPhone(bundle: dict, featureRow: dict) -> dict:
+def predictWeightFromPhone(bundle: dict, featureRow: dict, modelPreference: str = "auto") -> dict:
     task = bundle["tasks"]["weight_from_phone"]
-    candidate = recommendedCandidate(task)
+    candidate = selectCandidateByPreference(task, modelPreference)
     features = np.asarray([[float(featureRow[name]) for name in FEATURE_NAMES]], dtype=np.float64)
     if candidate["modelType"] == "mlp_weight":
         predG, probs = predictWeightMlp(candidate, features)
@@ -831,14 +858,15 @@ def predictWeightFromPhone(bundle: dict, featureRow: dict) -> dict:
         "nearestWeightG": nearestWeight,
         "nearestIndex": nearestIndex,
         "modelType": candidate["modelType"],
+        "modelPreference": modelPreference,
         "task": "weight_from_phone",
         "classProbabilities": probs,
     }
 
 
-def predictStandardDeflectionFromWeight(bundle: dict, weightG: float) -> dict:
+def predictStandardDeflectionFromWeight(bundle: dict, weightG: float, modelPreference: str = "auto") -> dict:
     task = bundle["tasks"]["deflection_from_weight"]
-    candidate = recommendedCandidate(task)
+    candidate = selectCandidateByPreference(task, modelPreference)
     features = weightFeatureMatrix(np.asarray([float(weightG)], dtype=np.float64))
     if candidate["modelType"] == "mlp_regression":
         predMm = predictRegressionMlp(candidate, features)
@@ -849,14 +877,15 @@ def predictStandardDeflectionFromWeight(bundle: dict, weightG: float) -> dict:
     return {
         "predictedStandardDeflectionMm": predMm,
         "modelType": candidate["modelType"],
+        "modelPreference": modelPreference,
         "task": "deflection_from_weight",
         "inputWeightG": float(weightG),
     }
 
 
-def predictStandardDeflectionFromPhone(bundle: dict, featureRow: dict) -> dict:
+def predictStandardDeflectionFromPhone(bundle: dict, featureRow: dict, modelPreference: str = "auto") -> dict:
     task = bundle["tasks"]["laser_from_phone"]
-    candidate = recommendedCandidate(task)
+    candidate = selectCandidateByPreference(task, modelPreference)
     features = np.asarray([[float(featureRow[name]) for name in FEATURE_NAMES]], dtype=np.float64)
     if candidate["modelType"] == "mlp_regression":
         predMm = predictRegressionMlp(candidate, features)
@@ -870,5 +899,6 @@ def predictStandardDeflectionFromPhone(bundle: dict, featureRow: dict) -> dict:
         "phoneDeflectionMm": phoneMm,
         "predictedPhoneMinusStandardMm": phoneMm - predMm,
         "modelType": candidate["modelType"],
+        "modelPreference": modelPreference,
         "task": "laser_from_phone",
     }

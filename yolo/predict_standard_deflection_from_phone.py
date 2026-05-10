@@ -12,6 +12,12 @@ def parseArgs() -> argparse.Namespace:
     parser.add_argument("--model-path", required=True, help="train_bridge_task_models.py 输出的 model_bundle.pth/json")
     parser.add_argument("--windows-csv", required=True, help="需要校正的 weight_windows_*.csv")
     parser.add_argument("--output-csv", default="", help="输出 CSV；为空则只打印")
+    parser.add_argument(
+        "--model-choice",
+        choices=["auto", "mlp", "monotonic", "ridge"],
+        default="auto",
+        help="候选模型选择。auto 使用训练时推荐；mlp 强制神经网络；monotonic 强制单调函数逼近器",
+    )
     return parser.parse_args()
 
 
@@ -27,7 +33,7 @@ def main() -> int:
     outputRows: list[dict] = []
     print("\n================ 任务三：手机挠度 -> 标准挠度 ================")
     for row in rows:
-        result = predictStandardDeflectionFromPhone(bundle, row)
+        result = predictStandardDeflectionFromPhone(bundle, row, modelPreference=args.model_choice)
         out = {
             **row,
             "predictedStandardDeflectionMm": result["predictedStandardDeflectionMm"],

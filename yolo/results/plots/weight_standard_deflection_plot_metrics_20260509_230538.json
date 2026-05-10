@@ -1,0 +1,15 @@
+{
+  "sampleCount": 52,
+  "modelType": "monotonic_phone_weight",
+  "maeG": 28.155088141025658,
+  "rmseG": 56.73948562155891,
+  "maxAbsErrorG": 270.05208333333303,
+  "standardDeflectionRangeMm": [
+    1.25,
+    14.43
+  ],
+  "weightRangeG": [
+    300.0,
+    5015.7
+  ]
+}

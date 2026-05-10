@@ -25,6 +25,12 @@ def parseArgs() -> argparse.Namespace:
     parser.add_argument("--source", default="0")
     parser.add_argument("--model-path", required=True, help="best_weight_model.pth/json 或三任务 model_bundle.pth/json")
     parser.add_argument("--task", choices=["weight-from-phone"], default="weight-from-phone", help="三任务模型包中的预测任务")
+    parser.add_argument(
+        "--model-choice",
+        choices=["auto", "mlp", "monotonic", "ridge", "chained"],
+        default="auto",
+        help="三任务模型包候选选择。auto 使用训练时推荐；mlp 强制神经网络；monotonic 强制单调函数逼近器",
+    )
     parser.add_argument("--yolo-model", default="yolov8n.pt")
     parser.add_argument("--layout", default="yolo/artifacts/static_marker_layout.json")
     parser.add_argument("--target-class", default="midpoint_marker")
@@ -58,7 +64,11 @@ def parseArgs() -> argparse.Namespace:
     )
     parser.add_argument("--static-assist-min-points", type=int, default=4, help="静态姿态辅助所需最少角点数，4 表示 1 个静态标即可辅助")
     parser.add_argument("--predict-seconds", type=float, default=6.0)
-    parser.add_argument("--min-valid-frames", type=int, default=90)
+    parser.add_argument("--min-valid-frames", type=int, default=80)
+    parser.add_argument("--live-window-frames", type=int, default=5, help="实时重量预测使用的短滑动窗口帧数")
+    parser.add_argument("--weight-smooth-window", type=int, default=3, help="实时重量显示的轻量平滑帧数")
+    parser.add_argument("--zero-deflection-threshold-mm", type=float, default=0.3, help="小于该挠度认为未加载，避免模型外推负重量")
+    parser.add_argument("--min-output-weight-g", type=float, default=0.0, help="预测重量显示/输出下限")
     return parser.parse_args()
 
 
@@ -108,17 +118,50 @@ def printGuide(args: argparse.Namespace, modelPayload: dict) -> None:
         taskPayload = modelPayload["tasks"]["weight_from_phone"]
         print("模型包: bridge_task_models", flush=True)
         print(f"任务: {args.task}, 推荐候选: {taskPayload['recommended']}", flush=True)
+        print(f"实际候选选择: {args.model_choice}", flush=True)
     else:
         print(f"模型类型: {modelPayload.get('modelType')}", flush=True)
         print(f"训练档位(g): {modelPayload.get('weightsG')}", flush=True)
     print("============================================\n", flush=True)
 
 
-def makeSampleFrame(measurement: MeasurementFrame, localTime: float) -> WeightSampleFrame:
-    isValid = measurement.state.filteredMm is not None and measurement.state.status.startswith("tracking")
+def formatMaybe(value: object, digits: int = 3) -> str:
+    if value is None:
+        return "nan"
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if not np.isfinite(number):
+        return "nan"
+    return f"{number:.{digits}f}"
+
+
+def getMeasurementRawMm(measurement: MeasurementFrame) -> float | None:
+    rawMm = measurement.state.rawMm
+    if rawMm is None or not np.isfinite(rawMm):
+        return None
+    return float(rawMm)
+
+
+def updateShortFilter(rawMm: float | None, rawWindow: deque[float], windowSize: int) -> float | None:
+    if rawMm is None:
+        return None
+    rawWindow.append(float(rawMm))
+    while len(rawWindow) > max(1, windowSize):
+        rawWindow.popleft()
+    values = np.asarray(rawWindow, dtype=np.float64)
+    if values.size == 1:
+        return float(values[0])
+    return float(0.7 * np.median(values) + 0.3 * np.mean(values))
+
+
+def makeSampleFrame(measurement: MeasurementFrame, localTime: float, deflectionMm: float | None = None) -> WeightSampleFrame:
+    selectedDeflection = deflectionMm if deflectionMm is not None else measurement.state.filteredMm
+    isValid = selectedDeflection is not None and measurement.state.status.startswith("tracking")
     return WeightSampleFrame(
         timeSec=localTime,
-        deflectionMm=float(measurement.state.filteredMm) if measurement.state.filteredMm is not None else float("nan"),
+        deflectionMm=float(selectedDeflection) if selectedDeflection is not None else float("nan"),
         confidence=float(measurement.detection.confidence),
         quality=computeQuality(
             measurement.homographyResult.reprojectionRmsePx,
@@ -129,14 +172,110 @@ def makeSampleFrame(measurement: MeasurementFrame, localTime: float) -> WeightSa
     )
 
 
-def predictFromFrames(modelPayload: dict, frames: list[WeightSampleFrame]) -> tuple[dict | None, dict | None]:
+def predictFromFrames(modelPayload: dict, frames: list[WeightSampleFrame], modelChoice: str = "auto") -> tuple[dict | None, dict | None]:
     validCount = sum(1 for frame in frames if frame.isValid)
     if validCount < 5:
         return None, None
     featureRow = computeWindowFeatures(frames, sampleId="predict_window")
     if modelPayload.get("bundleType") == "bridge_task_models":
-        return predictWeightFromPhone(modelPayload, featureRow), featureRow
+        return predictWeightFromPhone(modelPayload, featureRow, modelPreference=modelChoice), featureRow
     return predictWeight(modelPayload, featureRow), featureRow
+
+
+def knownWeights(modelPayload: dict) -> list[float]:
+    if modelPayload.get("bundleType") == "bridge_task_models":
+        task = modelPayload.get("tasks", {}).get("weight_from_phone", {})
+        for candidate in task.get("candidates", []):
+            if candidate.get("modelType") == task.get("recommended") and candidate.get("weightsG"):
+                return [float(value) for value in candidate["weightsG"]]
+        for candidate in task.get("candidates", []):
+            if candidate.get("weightsG"):
+                return [float(value) for value in candidate["weightsG"]]
+        return []
+    return [float(value) for value in modelPayload.get("weightsG", [])]
+
+
+def nearestKnownWeight(weightG: float, weights: list[float]) -> tuple[float, int]:
+    if not weights:
+        return float(weightG), -1
+    arr = np.asarray(weights, dtype=np.float64)
+    index = int(np.argmin(np.abs(arr - weightG)))
+    return float(arr[index]), index
+
+
+def applyWeightGuards(
+    prediction: dict | None,
+    featureRow: dict | None,
+    args: argparse.Namespace,
+    weights: list[float],
+) -> dict | None:
+    if prediction is None:
+        return None
+    guarded = dict(prediction)
+    deflectionMean = None if featureRow is None else float(featureRow.get("deflectionMeanMm", float("nan")))
+    if deflectionMean is not None and np.isfinite(deflectionMean) and abs(deflectionMean) < args.zero_deflection_threshold_mm:
+        guarded["predictedWeightG"] = 0.0
+        guarded["nearestWeightG"] = 0.0
+        guarded["nearestIndex"] = -1
+        guarded["guardReason"] = "zero-deflection"
+        return guarded
+
+    predWeight = float(guarded.get("predictedWeightG", 0.0))
+    if predWeight < args.min_output_weight_g:
+        predWeight = float(args.min_output_weight_g)
+        guarded["guardReason"] = "min-output-clamp"
+    guarded["predictedWeightG"] = predWeight
+    nearestWeight, nearestIndex = nearestKnownWeight(predWeight, weights)
+    guarded["nearestWeightG"] = nearestWeight
+    guarded["nearestIndex"] = nearestIndex
+    return guarded
+
+
+def smoothWeightPrediction(prediction: dict | None, weightWindow: deque[float], weights: list[float]) -> dict | None:
+    if prediction is None:
+        return None
+    predWeight = float(prediction["predictedWeightG"])
+    weightWindow.append(predWeight)
+    values = np.asarray(weightWindow, dtype=np.float64)
+    smoothedWeight = float(0.7 * np.median(values) + 0.3 * np.mean(values))
+    smoothed = dict(prediction)
+    smoothed["rawPredictedWeightG"] = predWeight
+    smoothed["predictedWeightG"] = smoothedWeight
+    nearestWeight, nearestIndex = nearestKnownWeight(smoothedWeight, weights)
+    if smoothed.get("guardReason") == "zero-deflection":
+        nearestWeight, nearestIndex = 0.0, -1
+    smoothed["nearestWeightG"] = nearestWeight
+    smoothed["nearestIndex"] = nearestIndex
+    return smoothed
+
+
+def drawSparkline(
+    panel: np.ndarray,
+    values: list[float],
+    topLeft: tuple[int, int],
+    size: tuple[int, int],
+    color: tuple[int, int, int],
+) -> None:
+    x0, y0 = topLeft
+    width, height = size
+    cv2.rectangle(panel, (x0, y0), (x0 + width, y0 + height), (90, 90, 90), 1)
+    if len(values) < 2:
+        return
+    arr = np.asarray(values, dtype=np.float32)
+    arr = arr[np.isfinite(arr)]
+    if arr.size < 2:
+        return
+    vMin = float(np.min(arr))
+    vMax = float(np.max(arr))
+    if abs(vMax - vMin) < 1e-6:
+        vMax = vMin + 1e-6
+    points: list[tuple[int, int]] = []
+    for index, value in enumerate(arr):
+        x = x0 + int(index * (width - 1) / max(arr.size - 1, 1))
+        y = y0 + int((vMax - float(value)) / (vMax - vMin) * (height - 1))
+        points.append((x, y))
+    for index in range(1, len(points)):
+        cv2.line(panel, points[index - 1], points[index], color, 2, cv2.LINE_AA)
 
 
 def drawPrediction(
@@ -147,13 +286,22 @@ def drawPrediction(
     collecting: bool,
     validCount: int,
     args: argparse.Namespace,
+    deflectionHistoryMm: list[float],
+    weightHistoryG: list[float],
 ) -> np.ndarray:
     overlay = drawOverlay(measurement.frame, measurement.homographyResult, measurement.detection.centerPixel)
+    liveText = "Live weight(g): waiting"
+    nearestText = "Nearest(g): waiting"
+    if livePrediction is not None:
+        guardReason = livePrediction.get("guardReason")
+        suffix = " (no load)" if guardReason == "zero-deflection" else ""
+        liveText = f"Live weight(g): {livePrediction['predictedWeightG']:.2f}{suffix}"
+        nearestText = f"Nearest(g): {livePrediction['nearestWeightG']:.2f}"
     lines = [
-        f"Deflection(mm): {measurement.state.filteredMm}",
+        f"Deflection(mm): {formatMaybe(measurement.state.filteredMm)}",
         f"Status: {measurement.state.status}",
-        f"Live weight(g): {livePrediction['predictedWeightG']:.2f}" if livePrediction else "Live weight(g): nan",
-        f"Nearest(g): {livePrediction['nearestWeightG']:.2f}" if livePrediction else "Nearest(g): nan",
+        liveText,
+        nearestText,
         f"Collecting: {'YES' if collecting else 'NO'}",
         f"Valid: {validCount}/{args.min_valid_frames}",
         "Keys: S final prediction, Q quit",
@@ -180,6 +328,7 @@ def drawPrediction(
     panel = np.zeros((overlay.shape[0], 400, 3), dtype=np.uint8)
     panel[:] = (24, 24, 24)
     debugLines = [
+        f"Panel: ready from startup",
         f"Measure: {measurement.measurementMethod}",
         f"Detect: {measurement.detection.status}",
         f"Conf: {measurement.detection.confidence:.3f}",
@@ -189,8 +338,11 @@ def drawPrediction(
         f"Static axis: {measurement.staticAxisSource}",
         f"Plane tilt(deg): {measurement.staticPoseInfo.planeTiltDeg if measurement.staticPoseInfo else None}",
         f"Static roll(deg): {measurement.staticPoseInfo.rollDeg if measurement.staticPoseInfo else None}",
-        f"Raw(mm): {measurement.state.rawMm}",
-        f"Filtered(mm): {measurement.state.filteredMm}",
+        f"Raw(mm): {formatMaybe(measurement.state.rawMm)}",
+        f"Filtered(mm): {formatMaybe(measurement.state.filteredMm)}",
+        f"Live window(fr): {args.live_window_frames}",
+        f"Weight smooth(fr): {args.weight_smooth_window}",
+        f"Zero gate(mm): {args.zero_deflection_threshold_mm}",
         f"Feature std(mm): {featureRow.get('deflectionStdMm') if featureRow else None}",
         f"Feature drift(mm/min): {featureRow.get('driftMmPerMin') if featureRow else None}",
     ]
@@ -198,13 +350,19 @@ def drawPrediction(
     for line in debugLines:
         cv2.putText(panel, line, (16, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (235, 235, 235), 1, cv2.LINE_AA)
         y += 24
+    cv2.putText(panel, "Deflection curve (mm)", (16, y + 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (120, 255, 160), 1, cv2.LINE_AA)
+    drawSparkline(panel, deflectionHistoryMm, (16, y + 18), (368, 95), (0, 255, 120))
+    y += 132
+    cv2.putText(panel, "Weight curve (g)", (16, y + 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (170, 220, 255), 1, cv2.LINE_AA)
+    drawSparkline(panel, weightHistoryG, (16, y + 18), (368, 95), (255, 180, 60))
     return np.hstack([overlay, panel])
 
 
-def waitForBaseline(capture: cv2.VideoCapture, measurer: RealtimeDeflectionMeasurer, fps: float, windowName: str) -> None:
+def waitForBaseline(capture: cv2.VideoCapture, measurer: RealtimeDeflectionMeasurer, fps: float, windowName: str, args: argparse.Namespace) -> None:
     print("请保持空载静止，然后在视频窗口按 s 开始基线。", flush=True)
     lastTime = time.time()
     started = False
+    deflectionHistoryMm: deque[float] = deque(maxlen=180)
     while True:
         ok, frame = capture.read()
         if not ok:
@@ -212,9 +370,20 @@ def waitForBaseline(capture: cv2.VideoCapture, measurer: RealtimeDeflectionMeasu
         now = time.time()
         measurement = measurer.process(frame, dtSec=min(now - lastTime, 1.0 / max(fps, 1.0)))
         lastTime = now
-        render = drawOverlay(measurement.frame, measurement.homographyResult, measurement.detection.centerPixel)
-        cv2.putText(render, "Empty bridge: press S to start baseline", (20, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (80, 220, 255), 2, cv2.LINE_AA)
-        cv2.putText(render, f"Status: {measurement.state.status}", (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 0), 2, cv2.LINE_AA)
+        if measurement.state.filteredMm is not None:
+            deflectionHistoryMm.append(float(measurement.state.filteredMm))
+        render = drawPrediction(
+            measurement,
+            livePrediction=None,
+            finalPrediction=None,
+            featureRow=None,
+            collecting=False,
+            validCount=0,
+            args=args,
+            deflectionHistoryMm=list(deflectionHistoryMm),
+            weightHistoryG=[],
+        )
+        cv2.putText(render, "Empty bridge: press S to start baseline", (20, 275), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (80, 220, 255), 2, cv2.LINE_AA)
         cv2.imshow(windowName, render)
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q"):
@@ -254,8 +423,14 @@ def main() -> int:
     cv2.namedWindow(windowName, cv2.WINDOW_NORMAL)
 
     try:
-        waitForBaseline(capture, measurer, fps, windowName)
-        rollingFrames: deque[WeightSampleFrame] = deque(maxlen=max(int(args.predict_seconds * fps), 10))
+        waitForBaseline(capture, measurer, fps, windowName, args)
+        weights = knownWeights(modelPayload)
+        rollingFrames: deque[WeightSampleFrame] = deque(maxlen=max(args.live_window_frames, 5))
+        liveRawWindow: deque[float] = deque(maxlen=max(args.live_window_frames, 1))
+        finalRawWindow: deque[float] = deque(maxlen=max(args.live_window_frames, 1))
+        weightSmoothWindow: deque[float] = deque(maxlen=max(args.weight_smooth_window, 1))
+        deflectionHistoryMm: deque[float] = deque(maxlen=180)
+        weightHistoryG: deque[float] = deque(maxlen=180)
         finalFrames: list[WeightSampleFrame] = []
         collecting = False
         finalStart: float | None = None
@@ -271,18 +446,27 @@ def main() -> int:
             measurement = measurer.process(frame, dtSec=min(now - lastTime, 1.0 / max(fps, 1.0)))
             lastTime = now
 
-            rollingFrames.append(makeSampleFrame(measurement, localTime=now))
-            livePrediction, featureRow = predictFromFrames(modelPayload, list(rollingFrames))
+            liveFilteredMm = updateShortFilter(getMeasurementRawMm(measurement), liveRawWindow, args.live_window_frames)
+            rollingFrames.append(makeSampleFrame(measurement, localTime=now, deflectionMm=liveFilteredMm))
+            livePrediction, featureRow = predictFromFrames(modelPayload, list(rollingFrames), args.model_choice)
+            livePrediction = applyWeightGuards(livePrediction, featureRow, args, weights)
+            livePrediction = smoothWeightPrediction(livePrediction, weightSmoothWindow, weights)
             if featureRow is not None:
                 lastFeatureRow = featureRow
+            if liveFilteredMm is not None:
+                deflectionHistoryMm.append(float(liveFilteredMm))
+            if livePrediction is not None:
+                weightHistoryG.append(float(livePrediction["predictedWeightG"]))
 
             validFinal = 0
             if collecting:
                 localTime = 0.0 if finalStart is None else now - finalStart
-                finalFrames.append(makeSampleFrame(measurement, localTime=localTime))
+                finalFilteredMm = updateShortFilter(getMeasurementRawMm(measurement), finalRawWindow, args.live_window_frames)
+                finalFrames.append(makeSampleFrame(measurement, localTime=localTime, deflectionMm=finalFilteredMm))
                 validFinal = sum(1 for item in finalFrames if item.isValid)
                 if localTime >= args.predict_seconds or validFinal >= args.min_valid_frames:
-                    finalPrediction, lastFeatureRow = predictFromFrames(modelPayload, finalFrames)
+                    finalPrediction, lastFeatureRow = predictFromFrames(modelPayload, finalFrames, args.model_choice)
+                    finalPrediction = applyWeightGuards(finalPrediction, lastFeatureRow, args, weights)
                     if finalPrediction is not None:
                         print(
                             f"最终预测: {finalPrediction['predictedWeightG']:.3f} g, "
@@ -298,6 +482,8 @@ def main() -> int:
                 collecting,
                 validFinal,
                 args,
+                list(deflectionHistoryMm),
+                list(weightHistoryG),
             )
             cv2.imshow(windowName, render)
             key = cv2.waitKey(1) & 0xFF
@@ -305,6 +491,7 @@ def main() -> int:
                 break
             if key == ord("s") and not collecting:
                 finalFrames.clear()
+                finalRawWindow.clear()
                 finalStart = time.time()
                 finalPrediction = None
                 collecting = True
