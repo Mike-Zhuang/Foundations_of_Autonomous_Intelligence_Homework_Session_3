@@ -8,6 +8,7 @@ from typing import Any, Callable
 import numpy as np
 
 from bridge_ai.weight_features import FEATURE_NAMES
+from bridge_ai.weight_model import makeRegLossFn
 
 
 DEFAULT_WINDOW_CSVS = [
@@ -398,6 +399,7 @@ def trainWeightMlpCandidate(
     lr: float,
     weightDecay: float,
     progressCallback: Callable[[str, int, int, float], None] | None = None,
+    regLoss: str = "huber",
 ) -> dict | None:
     try:
         import torch
@@ -441,7 +443,7 @@ def trainWeightMlpCandidate(
         trainMask[holdout] = False
         model = WeightNet(xNorm.shape[1], len(weights))
         optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weightDecay)
-        regLossFn = nn.HuberLoss(delta=1.0)
+        regLossFn = makeRegLossFn(regLoss, delta=1.0)
         clsLossFn = nn.CrossEntropyLoss()
         xTrain = torch.tensor(xNorm[trainMask], dtype=torch.float32)
         yTrain = torch.tensor(yNorm[trainMask], dtype=torch.float32).unsqueeze(1)
@@ -472,7 +474,7 @@ def trainWeightMlpCandidate(
 
     fullModel = WeightNet(xNorm.shape[1], len(weights))
     optimizer = torch.optim.AdamW(fullModel.parameters(), lr=lr, weight_decay=weightDecay)
-    regLossFn = nn.HuberLoss(delta=1.0)
+    regLossFn = makeRegLossFn(regLoss, delta=1.0)
     clsLossFn = nn.CrossEntropyLoss()
     xAll = torch.tensor(xNorm, dtype=torch.float32)
     yAll = torch.tensor(yNorm, dtype=torch.float32).unsqueeze(1)
@@ -495,6 +497,7 @@ def trainWeightMlpCandidate(
     metrics["classificationAccuracy"] = float(np.mean(np.asarray(looCls, dtype=np.int64) == labels))
     return {
         "modelType": "mlp_weight",
+        "regLossName": regLoss,
         "architecture": "input-32-16-8-regression-classification",
         "featureNames": FEATURE_NAMES,
         "xMean": mean.tolist(),
@@ -530,6 +533,7 @@ def trainWeightFromPhone(
     lr: float = 1e-3,
     weightDecay: float = 1e-3,
     progressCallback: Callable[[str, int, int, float], None] | None = None,
+    regLoss: str = "huber",
 ) -> dict:
     x = phoneFeatureMatrix(rows)
     y = targetArray(rows, "weightG")
@@ -545,7 +549,7 @@ def trainWeightFromPhone(
     )
     monotonic["weightsG"] = ridge["weightsG"]
     chained = trainChainedMonotonicWeightCandidate(rows)
-    mlp = trainWeightMlpCandidate(rows, x, y, epochs, lr, weightDecay, progressCallback)
+    mlp = trainWeightMlpCandidate(rows, x, y, epochs, lr, weightDecay, progressCallback, regLoss)
     candidates = [ridge, monotonic, chained] + ([mlp] if mlp is not None else [])
     recommended = selectCandidate(candidates, "G")
     return {"taskName": "weight_from_phone", "target": "weightG", "recommended": recommended["modelType"], "candidates": candidates}
@@ -627,6 +631,7 @@ def trainAllTasks(
     lr: float,
     weightDecay: float,
     progressCallback: Callable[[str, int, int, float], None] | None = None,
+    regLoss: str = "huber",
 ) -> dict:
     return {
         "bundleType": "bridge_task_models",
@@ -635,7 +640,7 @@ def trainAllTasks(
         "sourceSampleIds": [str(row.get("sampleId", "")) for row in rows],
         "weightRangeG": [float(min(targetArray(rows, "weightG"))), float(max(targetArray(rows, "weightG")))],
         "tasks": {
-            "weight_from_phone": trainWeightFromPhone(rows, epochs, lr, weightDecay, progressCallback),
+            "weight_from_phone": trainWeightFromPhone(rows, epochs, lr, weightDecay, progressCallback, regLoss),
             "deflection_from_weight": trainDeflectionFromWeight(rows, epochs, lr, weightDecay, progressCallback),
             "laser_from_phone": trainLaserFromPhone(rows, epochs, lr, weightDecay, progressCallback),
         },

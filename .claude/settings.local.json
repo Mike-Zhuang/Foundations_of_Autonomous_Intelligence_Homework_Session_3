@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(awk -F',' '{print $15}')",
+      "Bash(awk -F',' '{print $18}')",
+      "Bash(awk -F',' '{if\\($18!=\"\"\\) print $18}')",
+      "Bash(awk -F',' '{print $1\",\"$15\",\"$18}')",
+      "Bash(grep -v \"^$\")",
+      "Bash(awk -F',' '{if\\($15>=2000 && $15<=3000\\) print $1\",\"$15\",\"$18\",\"$16}')",
+      "Bash(awk -F',' 'NR>1 {print NR-1, $1, $15, $16, $17}' \"F:/TJ/Foundations_of_Autonomous_Intelligence_Homework_Session_3/yolo/results/weight_windows_merged_20260509_230538_20260510_224611.csv\")",
+      "Bash(awk -F',' 'NR>1 {n=split\\($1,a,\"_\"\\); session=\"\"; for\\(i=2;i<n;i++\\){if\\(a[i]+0==a[i]\\){session=a[i]}}; printf \"%s %s %.1f %.2f %.2f %.2f\\\\n\", $1, a[2], $15, $4, $16, $17}' \"F:/TJ/Foundations_of_Autonomous_Intelligence_Homework_Session_3/yolo/results/weight_windows_merged_20260509_230538_20260510_224611.csv\")",
+      "Bash(python -c \"from bridge_ai.weight_filters import AVAILABLE_FILTER_NAMES, createFilter, smoothWeightWithFilter; print\\('Filter names:', AVAILABLE_FILTER_NAMES\\); f = createFilter\\('default'\\); print\\('Default filter:', f.name\\); f2 = createFilter\\('kalman'\\); print\\('Kalman filter:', f2.name\\)\")"
+    ]
+  }
+}

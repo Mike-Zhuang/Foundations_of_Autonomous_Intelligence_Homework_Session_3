@@ -18,6 +18,7 @@ from bridge_ai.realtime_measurement import MeasurementConfig, MeasurementFrame, 
 from bridge_ai.weight_features import WeightSampleFrame, computeQuality, computeWindowFeatures
 from bridge_ai.bridge_task_models import predictWeightFromPhone
 from bridge_ai.weight_model import loadModel, predictWeight
+from bridge_ai.weight_filters import AVAILABLE_FILTER_NAMES, createFilter, smoothWeightWithFilter
 
 
 def parseArgs() -> argparse.Namespace:
@@ -69,6 +70,12 @@ def parseArgs() -> argparse.Namespace:
     parser.add_argument("--weight-smooth-window", type=int, default=3, help="实时重量显示的轻量平滑帧数")
     parser.add_argument("--zero-deflection-threshold-mm", type=float, default=0.3, help="小于该挠度认为未加载，避免模型外推负重量")
     parser.add_argument("--min-output-weight-g", type=float, default=0.0, help="预测重量显示/输出下限")
+    parser.add_argument(
+        "--smooth-method",
+        choices=AVAILABLE_FILTER_NAMES,
+        default="default",
+        help="实时重量平滑策略: default (当前 median+mean), conf_ema (置信度EMA), kalman (1D卡尔曼), adaptive_peak (质量门控峰值)",
+    )
     return parser.parse_args()
 
 
@@ -342,6 +349,7 @@ def drawPrediction(
         f"Filtered(mm): {formatMaybe(measurement.state.filteredMm)}",
         f"Live window(fr): {args.live_window_frames}",
         f"Weight smooth(fr): {args.weight_smooth_window}",
+        f"Smooth method: {args.smooth_method}",
         f"Zero gate(mm): {args.zero_deflection_threshold_mm}",
         f"Feature std(mm): {featureRow.get('deflectionStdMm') if featureRow else None}",
         f"Feature drift(mm/min): {featureRow.get('driftMmPerMin') if featureRow else None}",
@@ -428,7 +436,7 @@ def main() -> int:
         rollingFrames: deque[WeightSampleFrame] = deque(maxlen=max(args.live_window_frames, 5))
         liveRawWindow: deque[float] = deque(maxlen=max(args.live_window_frames, 1))
         finalRawWindow: deque[float] = deque(maxlen=max(args.live_window_frames, 1))
-        weightSmoothWindow: deque[float] = deque(maxlen=max(args.weight_smooth_window, 1))
+        weightFilter = createFilter(args.smooth_method, windowSize=args.weight_smooth_window)
         deflectionHistoryMm: deque[float] = deque(maxlen=180)
         weightHistoryG: deque[float] = deque(maxlen=180)
         finalFrames: list[WeightSampleFrame] = []
@@ -450,7 +458,7 @@ def main() -> int:
             rollingFrames.append(makeSampleFrame(measurement, localTime=now, deflectionMm=liveFilteredMm))
             livePrediction, featureRow = predictFromFrames(modelPayload, list(rollingFrames), args.model_choice)
             livePrediction = applyWeightGuards(livePrediction, featureRow, args, weights)
-            livePrediction = smoothWeightPrediction(livePrediction, weightSmoothWindow, weights)
+            livePrediction = smoothWeightWithFilter(livePrediction, weightFilter, weights)
             if featureRow is not None:
                 lastFeatureRow = featureRow
             if liveFilteredMm is not None:
@@ -492,6 +500,7 @@ def main() -> int:
             if key == ord("s") and not collecting:
                 finalFrames.clear()
                 finalRawWindow.clear()
+                weightFilter.reset()
                 finalStart = time.time()
                 finalPrediction = None
                 collecting = True

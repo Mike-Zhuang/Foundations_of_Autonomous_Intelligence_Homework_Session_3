@@ -48,6 +48,8 @@ def parseArgs() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=42, help="随机种子，用于让小 MLP 训练尽量可复现")
     parser.add_argument("--plain-output", action="store_true", help="关闭 Rich 彩色表格和进度条，使用普通文本输出")
+    parser.add_argument("--reg-loss", choices=["huber", "pinball"], default="huber",
+        help="MLP 回归损失函数: huber (默认，对称), pinball (分位数/上包络线)")
     return parser.parse_args()
 
 
@@ -224,9 +226,10 @@ def main() -> int:
                 lr=args.lr,
                 weightDecay=args.weight_decay,
                 progressCallback=callback,
+                regLoss=args.reg_loss,
             )
     else:
-        bundle = trainAllTasks(rows, epochs=args.epochs, lr=args.lr, weightDecay=args.weight_decay)
+        bundle = trainAllTasks(rows, epochs=args.epochs, lr=args.lr, weightDecay=args.weight_decay, regLoss=args.reg_loss)
     printTaskMetrics(bundle, richTools)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")

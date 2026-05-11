@@ -15,6 +15,8 @@ def parseArgs() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=500)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-3)
+    parser.add_argument("--reg-loss", choices=["huber", "pinball"], default="huber",
+        help="MLP 回归损失函数: huber (默认，对称), pinball (分位数/上包络线)")
     return parser.parse_args()
 
 
@@ -46,7 +48,7 @@ def main() -> int:
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     outputDir = Path(args.output_dir) if args.output_dir else Path(f"yolo/results/weight_model_{timestamp}")
-    best = trainAndSelect(rows, epochs=args.epochs, lr=args.lr, weightDecay=args.weight_decay)
+    best = trainAndSelect(rows, epochs=args.epochs, lr=args.lr, weightDecay=args.weight_decay, regLoss=args.reg_loss)
     paths = saveBestModel(best, outputDir)
 
     print("\n================ 训练完成 ================", flush=True)

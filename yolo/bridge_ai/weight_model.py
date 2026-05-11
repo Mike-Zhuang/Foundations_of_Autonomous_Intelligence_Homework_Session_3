@@ -6,6 +6,26 @@ from typing import Any
 
 import numpy as np
 
+try:
+    import torch.nn as _nn
+
+    class PinballLoss(_nn.Module):
+        def __init__(self, quantile: float = 0.90) -> None:
+            super().__init__()
+            self.quantile = quantile
+
+        def forward(self, pred, target):
+            import torch
+
+            error = target - pred
+            return torch.mean(torch.where(
+                error >= 0,
+                self.quantile * error,
+                (self.quantile - 1.0) * error,
+            ))
+except ImportError:
+    PinballLoss = None  # type: ignore[assignment,misc]
+
 from bridge_ai.weight_features import FEATURE_NAMES
 
 
@@ -60,6 +80,14 @@ def nearestClass(predWeight: float, weights: list[float]) -> tuple[float, int]:
     arr = np.asarray(weights, dtype=np.float64)
     index = int(np.argmin(np.abs(arr - predWeight)))
     return float(arr[index]), index
+
+
+def makeRegLossFn(name: str, delta: float = 5.0, quantile: float = 0.90):
+    import torch.nn as nn
+
+    if name == "pinball":
+        return PinballLoss(quantile=quantile)
+    return nn.HuberLoss(delta=delta)
 
 
 def trainRidgeModels(rows: list[dict]) -> dict:
@@ -118,7 +146,7 @@ def trainRidgeModels(rows: list[dict]) -> dict:
     }
 
 
-def trainMlpModel(rows: list[dict], epochs: int, lr: float, weightDecay: float, verboseEvery: int = 25) -> dict:
+def trainMlpModel(rows: list[dict], epochs: int, lr: float, weightDecay: float, verboseEvery: int = 25, regLoss: str = "huber") -> dict:
     try:
         import torch
         import torch.nn as nn
@@ -160,7 +188,7 @@ def trainMlpModel(rows: list[dict], epochs: int, lr: float, weightDecay: float, 
 
         model = TinyWeightNet(inputDim=xNorm.shape[1], classCount=len(weights))
         optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weightDecay)
-        regLossFn = nn.HuberLoss(delta=5.0)
+        regLossFn = makeRegLossFn(regLoss, delta=5.0)
         clsLossFn = nn.CrossEntropyLoss()
 
         xTrain = torch.tensor(xNorm[trainMask], dtype=torch.float32)
@@ -196,7 +224,7 @@ def trainMlpModel(rows: list[dict], epochs: int, lr: float, weightDecay: float, 
 
     fullModel = TinyWeightNet(inputDim=xNorm.shape[1], classCount=len(weights))
     optimizer = torch.optim.AdamW(fullModel.parameters(), lr=lr, weight_decay=weightDecay)
-    regLossFn = nn.HuberLoss(delta=5.0)
+    regLossFn = makeRegLossFn(regLoss, delta=5.0)
     clsLossFn = nn.CrossEntropyLoss()
     xAll = torch.tensor(xNorm, dtype=torch.float32)
     yAll = torch.tensor(y, dtype=torch.float32).unsqueeze(1)
@@ -218,6 +246,7 @@ def trainMlpModel(rows: list[dict], epochs: int, lr: float, weightDecay: float, 
     metrics["classificationAccuracy"] = clsAcc
     return {
         "modelType": "mlp",
+        "regLossName": regLoss,
         "featureNames": FEATURE_NAMES,
         "xMean": mean.tolist(),
         "xStd": std.tolist(),
@@ -237,7 +266,7 @@ def trainMlpModel(rows: list[dict], epochs: int, lr: float, weightDecay: float, 
     }
 
 
-def trainAndSelect(rows: list[dict], epochs: int, lr: float, weightDecay: float) -> dict:
+def trainAndSelect(rows: list[dict], epochs: int, lr: float, weightDecay: float, regLoss: str = "huber") -> dict:
     print("开始训练稳健拟合模型（线性/二次/岭回归，LOOCV）...", flush=True)
     ridge = trainRidgeModels(rows)
     print(
@@ -249,7 +278,7 @@ def trainAndSelect(rows: list[dict], epochs: int, lr: float, weightDecay: float)
     mlp = None
     try:
         print("开始训练小 MLP（LOOCV + 全量重训）...", flush=True)
-        mlp = trainMlpModel(rows, epochs=epochs, lr=lr, weightDecay=weightDecay)
+        mlp = trainMlpModel(rows, epochs=epochs, lr=lr, weightDecay=weightDecay, regLoss=regLoss)
         print(
             f"[MLP] LOOCV MAE={mlp['metrics']['maeG']:.3f}g "
             f"RMSE={mlp['metrics']['rmseG']:.3f}g Acc={mlp['metrics']['classificationAccuracy']:.3f}",
