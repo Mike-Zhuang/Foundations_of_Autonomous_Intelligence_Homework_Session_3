@@ -1,0 +1,25 @@
+{
+  "phoneFeatureNames": [
+    "deflectionMeanMm",
+    "deflectionP50Mm",
+    "deflectionP05Mm",
+    "deflectionP95Mm",
+    "deflectionStdMm",
+    "deflectionRangeMm",
+    "deflectionSlopeMmPerSec",
+    "driftMmPerMin",
+    "validRate",
+    "confidenceMean",
+    "qualityMean"
+  ],
+  "weightFeatureNames": [
+    "weightG",
+    "weightSquared",
+    "sqrtWeightG",
+    "log1pWeightG"
+  ],
+  "defaultWindowCsvs": [
+    "yolo/results/weight_windows_20260508_191017.csv",
+    "yolo/results/weight_windows_20260508_194555.csv"
+  ]
+}
